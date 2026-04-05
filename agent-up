@@ -17,9 +17,11 @@ fi
 echo "Launching isolated sandbox for: $PROJECT_NAME"
 
 # Spin up an ephemeral container
+
 docker run -it --rm \
   --name "agent-$PROJECT_NAME" \
   --runtime=runsc \
+  --security-opt label=disable \
   -v "$PROJECT_PATH:/work" \
   -w /work \
   -e OPENCODE_API_KEY=$OPENCODE_API_KEY \

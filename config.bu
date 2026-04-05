@@ -1,0 +1,51 @@
+variant: flatcar
+version: 1.1.0
+passwd:
+  users:
+    - name: ranton
+      groups: [sudo, docker]
+      ssh_authorized_keys:
+        - "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC/bE/TCtaXNjaAbaI1vl+Gvw19nS4wqTonwX43lwYtLlENcsRujrQKczVjGEiOe574WYGul2Zsm6i8y+r2PXDhWLqASWc5yZAlL3IOP6Beisi2Qn6UC0ehPMND9nWoDbEtEtnxO8KStv43g08iGmzO5qB8QOM81tb7/G59Ev5lhfIF1y8ZRYHaQ19RChnmRfS4J00iJJf7D24ZKg1TKMyx3N+L/a0a40PY4hLaSRi0JryQ/x9kzTk6UoBhCIh0sOGK8fCbjy3rCj0uDFVw1PBFWtW5g1Coor4ZCN+bWrdiREEP/OQQuD7TV6m3aKt4AW8HKs7JLfG/pqvfCyzOueGU+luOL8gdyDWCOGaJwyVSFL+c+Lhc0EA7MwT2TggZ7b5uVBtoB2VgH6QrPaL1H6Y0bur6RHPL6+YZsW4ryIQ/1Kez2uRitZYtkJdT2yoDOvuT7YvF9x3/2UcMI14spjJsxD1lXCbOMF9qtvRM+wKnf+IT1IWHYEpoizGEbG0/LB0= ranton@skia"
+
+storage:
+  directories:
+    - path: /opt/bin
+      mode: 0755
+  files:
+    - path: /etc/hostname
+      mode: 0644
+      contents:
+        inline: ai-fortress-general
+
+systemd:
+  units:
+    # Mount the 'host_projects' share from the host to /projects
+    - name: projects.mount
+      enabled: true
+      contents: |
+        [Unit]
+        Description=Mount General Projects Directory
+        Before=docker.service
+        [Mount]
+        What=host_projects
+        Where=/projects
+        Type=virtiofs
+        [Install]
+        WantedBy=multi-user.target
+
+    # Automatic gVisor (runsc) installation
+    - name: install-gvisor.service
+      enabled: true
+      contents: |
+        [Unit]
+        Description=Install gVisor Runtime
+        After=network-online.target
+        Wants=network-online.target
+        ConditionPathExists=!/opt/bin/runsc
+        [Service]
+        Type=oneshot
+        ExecStart=/usr/bin/curl -L https://storage.googleapis.com/gvisor/releases/release/latest/x86_64/runsc -o /opt/bin/runsc
+        ExecStart=/usr/bin/chmod +x /opt/bin/runsc
+        RemainAfterExit=yes
+        [Install]
+        WantedBy=multi-user.target

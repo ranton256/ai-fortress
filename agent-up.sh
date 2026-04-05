@@ -1,0 +1,27 @@
+#!/bin/bash
+PROJECT_NAME=$1
+
+if [ -z "$PROJECT_NAME" ]; then
+    echo "Usage: agent-up <project_folder_name>"
+    exit 1
+fi
+
+# Full path inside the VM
+PROJECT_PATH="/projects/$PROJECT_NAME"
+
+if [ ! -d "$PROJECT_PATH" ]; then
+    echo "Error: Project directory $PROJECT_PATH does not exist."
+    exit 1
+fi
+
+echo "Launching isolated sandbox for: $PROJECT_NAME"
+
+# Spin up an ephemeral container
+docker run -it --rm \
+  --name "agent-$PROJECT_NAME" \
+  --runtime=runsc \
+  -v "$PROJECT_PATH:/work" \
+  -w /work \
+  -e OPENCODE_API_KEY=$OPENCODE_API_KEY \
+  -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
+  ghcr.io/anomalyco/opencode:latest

@@ -1,6 +1,93 @@
-# README for ai-fortress
+# README: The AI Fortress (Flatcar + gVisor + Libvirt)
 
+This setup represents a **"Defense-in-Depth"** approach to agentic AI development. By moving the execution of AI-generated code from your primary workstation into a multi-layered sandbox, you mitigate the risk of "stochastic accidents" or malicious escapes while maintaining high performance on local hardware.
 
+## 1. Background & Motivation
+
+AI agents (OpenCode, Claude Code, etc.) are increasingly capable of executing shell commands and writing to the filesystem. However, giving an LLM-driven process direct access to a primary workstation presents significant security risks:
+
+- **Kernel Exploits:** A container escape could compromise the host.
+- **Data Exfiltration:** Agents could inadvertently (or maliciously) access private keys, documents, or unrelated projects.
+- **Dependency Hell:** Global installs by agents can clutter the host OS.
+
+**The Solution:** This architecture utilizes a "Russian Doll" isolation strategy:
+
+1. **Level 1 (KVM):** A dedicated Virtual Machine (Flatcar) isolates the environment from the physical host kernel.
+2. **Level 2 (Immutable OS):** Flatcar Container Linux provides a read-only root filesystem, preventing persistent malware.
+3. **Level 3 (gVisor):** A user-space kernel (`runsc`) intercepts syscalls, trapping the agent in a fake kernel.
+4. **Level 4 (Ephemeral Mounts):** Containers are scoped to specific subdirectories, ensuring one project cannot see another.
+
+## 2. Architecture Overview
+
+- **Host:** Linux Workstation (Skia).
+- **VM:** Flatcar Container Linux (Stable) via `libvirt`.
+- **Storage:** `virtio-fs` bridges the host `~/projects` folder to the VM at `/projects`.
+- **Runtime:** `gVisor` (runsc) configured as a Docker runtime.
+
+## 3. Prerequisites
+
+- `libvirt`, `qemu-kvm`, and `virt-install` installed on the host.
+- Host user added to `libvirt` and `kvm` groups.
+- SELinux booleans set: `sudo setsebool -P virt_use_nfs 1` (for virtio-fs support).
+
+## 4. Setup Instructions
+
+### A. Prepare the Base Image
+
+1. Download the Flatcar QEMU image.
+
+2. Create a **Backing File** (Snapshot) to keep the base image pristine:
+
+   Bash
+
+   ```
+   qemu-img create -f qcow2 -F qcow2 -b ~/ai-fortress/flatcar_production_qemu_image.img ~/ai-fortress/ai-fortress-snapshot.qcow2 50G
+   ```
+
+### B. Generate Ignition Config
+
+Create a `config.bu` (Butane) file to define the VM state (users, mounts, and gVisor install service). Transpile it:
+
+Bash
+
+```
+docker run --rm -i quay.io/coreos/butane:release < config.bu > config.json
+sudo mv config.json /var/lib/libvirt/images/
+```
+
+### C. Provision the VM
+
+Run the `virt-install` script using `virtio-fs` for the project mount and `fw_cfg` to pass the Ignition config:
+
+Bash
+
+```
+virt-install \
+  --name ai-fortress \
+  --ram 16384 \
+  --vcpus 4 \
+  --disk path=~/ai-fortress/ai-fortress-snapshot.qcow2,format=qcow2 \
+  --filesystem type=mount,accessmode=passthrough,driver.type=virtiofs,source.dir=/home/ranton/projects,target.dir=host_projects \
+  --qemu-commandline="-fw_cfg name=opt/org.flatcar-linux/config,file=/var/lib/libvirt/images/config.json"
+```
+
+### D. Arm the Sandbox (Inside VM)
+
+1. Install gVisor to `/opt/bin/runsc`.
+2. Configure Docker (`/etc/docker/daemon.json`) to include the `runsc` runtime.
+3. Restart Docker: `sudo systemctl restart docker`.
+
+## 5. Usage: The "On-Demand" Agent
+
+Launch an isolated sandbox for a specific project directory:
+
+Bash
+
+```
+agent <project-folder-name>
+```
+
+This triggers the `agent-up` script, which launches a gVisor-trapped container with `--security-opt label=disable` to bypass SELinux conflicts between the VM and the sandbox.
 
 
 ## Getting out of VM or cleaning up

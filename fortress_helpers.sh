@@ -10,6 +10,6 @@ function agent() {
 
     # Run the agent over SSH with TTY support
     ssh -t ranton@$VM_IP \
-      "OPENCODE_API_KEY=$OPENCODE_API_KEY ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY /opt/bin/agent-up $1"
+      "OPENCODE_API_KEY=$OPENCODE_API_KEY ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY /opt/bin/agent-up $1 $2"
 }
 

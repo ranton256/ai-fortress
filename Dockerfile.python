@@ -1,0 +1,34 @@
+# Dockerfile.python
+FROM python:3.12-slim
+
+# Build-time arguments for reusability
+ARG USERNAME=developer
+ARG USER_UID=1000
+ARG USER_GID=$USER_UID
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    git \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create a group and user matching the host's IDs
+RUN groupadd --gid $USER_GID $USERNAME \
+    && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME
+
+WORKDIR /work
+
+# Pre-install core dev tools
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir \
+    pytest requests pydantic python-dotenv numpy pandas ruff black
+
+# Ensure the developer user owns their workspace and home
+RUN chown $USER_UID:$USER_GID /work
+USER $USERNAME
+
+ENTRYPOINT ["python3"]

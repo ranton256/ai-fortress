@@ -1,29 +1,38 @@
 #!/bin/bash
 PROJECT_NAME=$1
+TYPE=${2:-default}
 
 if [ -z "$PROJECT_NAME" ]; then
-    echo "Usage: agent-up <project_folder_name>"
+    echo "Usage: agent-up <project_folder> [python|default]"
     exit 1
 fi
 
-# Full path inside the VM
 PROJECT_PATH="/projects/$PROJECT_NAME"
 
-if [ ! -d "$PROJECT_PATH" ]; then
-    echo "Error: Project directory $PROJECT_PATH does not exist."
-    exit 1
-fi
+# Dynamic Image Selection
+case $TYPE in
+  python)
+    IMAGE="ai-fortress/python-dev:latest"
+    ;;
+  *)
+    IMAGE="ghcr.io/anomalyco/opencode:latest"
+    ;;
+esac
 
-echo "Launching isolated sandbox for: $PROJECT_NAME"
+# Ensure the container runs as the current user to maintain 1:1 file permissions
+# even if the image wasn't built with the exact matching UID.
+USER_FLAGS="--user $(id -u):$(id -g)"
 
-# Spin up an ephemeral container
+echo "--- Launching $TYPE Sandbox for: $PROJECT_NAME ---"
 
 docker run -it --rm \
-  --name "agent-$PROJECT_NAME" \
+  $USER_FLAGS \
+  --name "agent-$PROJECT_NAME-$(date +%s)" \
   --runtime=runsc \
   --security-opt label=disable \
   -v "$PROJECT_PATH:/work" \
   -w /work \
-  -e OPENCODE_API_KEY=$OPENCODE_API_KEY \
-  -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
-  ghcr.io/anomalyco/opencode:latest
+  -e OPENCODE_API_KEY \
+  -e ANTHROPIC_API_KEY \
+  -e OPENAI_API_KEY \
+  $IMAGE

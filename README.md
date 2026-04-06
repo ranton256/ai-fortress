@@ -143,3 +143,11 @@ sudo tail -n 50 /var/log/libvirt/qemu/ai-fortress.log
 * **Ignition Error:** If you see "failed to fetch config," it means the `fw_cfg` path in your script didn't point to the `config.json` correctly.
 
 What did the console output look like before you got stuck? If you saw a **"Reached target Multi-User System"** message, the VM actually booted successfully, and you're just a `Ctrl + ]` away from victory!
+after reboot to recreate things needed inside the VM after recreation
+you will need to verify networking still works
+
+setup /etc/docker/daemon.json
+
+make sure runsc is still installed
+
+restart docker daemon after change

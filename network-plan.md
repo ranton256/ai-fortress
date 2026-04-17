@@ -2,7 +2,7 @@
 
 ## Goals
 
-1. **No upstream API credentials inside the VM, ever.** The real `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` live only on the host workstation. A full VM compromise (gVisor escape + privilege escalation in Flatcar) must not yield them.
+1. **No upstream API credentials inside the VM, ever.** The real `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` live only on the host workstation. A full VM compromise (gVisor escape + privilege escalation in Flatcar) must not yield them. The sandbox does still hold a credential — a short-lived virtual key — but never the upstream key that mints virtual keys or controls billing.
 2. **No sandbox-initiated network egress except via the proxy.** Sandbox containers can only reach one destination: a vsock-mediated relay to the host proxy. They cannot reach the internet, the libvirt NAT, or each other.
 3. **Per-sandbox virtual keys with capped budgets and TTLs.** A leaked sandbox token expires within hours and can spend at most a few dollars before exhaustion.
 4. **No new TCP listeners on the host's IP network.** The proxy is reachable from the VM only via `AF_VSOCK`, not via `virbr0` or any other host interface.
@@ -76,6 +76,8 @@ agent SDK
 
 SSE responses flow back the same path. Every hop is byte-transparent so streaming preserves event boundaries.
 
+**Plaintext on internal hops is intentional.** Sandbox→shim is plain HTTP across an internal Docker bridge (single host, no LAN exposure). Shim→host relay is plain bytes over `AF_VSOCK` (hypervisor-mediated, never on any IP network). Host relay→LiteLLM is plain HTTP on `127.0.0.1` (loopback). LiteLLM does TLS to the upstream API. Adding TLS on the internal hops would mean either a self-signed cert that every client has to trust, or running an in-VM CA — both add operational pain without closing any threat that the existing isolation doesn't already cover.
+
 ## Trust tiers
 
 | Tier | Component                   | Runtime              | Trusted with                                                  |
@@ -90,9 +92,11 @@ The key invariant: secrets only flow downward by one tier at a time, and only th
 
 ## Component-by-component design
 
-### Host: secrets file
+### Host: secrets files
 
-`/etc/ai-fortress/upstream.env`, mode `0600`, owned by `root:root`, never checked into git.
+Two files, split by who needs to read them.
+
+`/etc/ai-fortress/upstream.env` — read by the LiteLLM daemon only. Mode `0600`, owned by `root:root`, never checked into git.
 
 ```
 ANTHROPIC_UPSTREAM_KEY=sk-ant-...
@@ -100,7 +104,13 @@ OPENAI_UPSTREAM_KEY=sk-...
 LITELLM_MASTER_KEY=sk-master-<32 random bytes, base64>
 ```
 
-Created once, by hand, after running `openssl rand -base64 32` for the master key. The same file is read by both the LiteLLM systemd unit and the agent launcher script — those are the only two consumers, both running as root or as a member of a dedicated `fortress` group.
+`/etc/ai-fortress/master-key.env` — read by the user-invoked launcher. Mode `0640`, owned by `root:fortress`. Contains only the master key (a duplicate, intentional):
+
+```
+LITELLM_MASTER_KEY=sk-master-<same value as above>
+```
+
+The master key is generated once with `openssl rand -base64 32` and written into both files. The split is so the unprivileged user shell that runs `~/bin/agent` never has access to the upstream API keys — only to the master key it needs to mint virtual keys. Create the group and add yourself: `sudo groupadd -r fortress && sudo usermod -aG fortress $USER`. Log out and back in (or `newgrp fortress`) before first use.
 
 ### Host: LiteLLM proxy
 
@@ -173,7 +183,7 @@ Requires=ai-fortress-litellm.service
 [Service]
 Restart=always
 RestartSec=2
-ExecStart=/usr/bin/socat -d \
+ExecStart=/usr/bin/socat -ly \
   VSOCK-LISTEN:4000,reuseaddr,fork \
   TCP:127.0.0.1:4000,nodelay
 NoNewPrivileges=true
@@ -187,7 +197,7 @@ AmbientCapabilities=
 WantedBy=multi-user.target
 ```
 
-Requires socat ≥ 1.7.4 (vsock support landed in 1.7.4). Fedora 41 ships a recent enough version. `nodelay` keeps SSE token latency tight.
+Requires socat ≥ 1.7.4 (vsock support landed in 1.7.4). Fedora 41 ships a recent enough version. `nodelay` keeps SSE token latency tight; `-ly` routes socat's own logs to syslog instead of stderr (`-d` is debug-noisy at steady state).
 
 The unit needs to read/write `/dev/vsock`, which is owned by `root:kvm` mode `0660` on most distros. Either run as root (simplest, locked down by the systemd hardening above), or add a `User=` directive and add that user to `kvm`.
 
@@ -239,43 +249,68 @@ PROJECT_NAME="${1:-}"
 TYPE="${2:-default}"
 [[ -z "$PROJECT_NAME" ]] && { echo "usage: agent <project> [python|default]" >&2; exit 1; }
 
-# Read master key (host only, never crosses into VM)
-source /etc/ai-fortress/upstream.env
+# Customize for your install (override via env if you want):
+VM_NAME="${FORTRESS_VM_NAME:-ai-fortress}"
+VM_USER="${FORTRESS_VM_USER:-$USER}"   # MUST match the user provisioned in config.bu
+                                        # so virtiofs UIDs line up with /projects on the host
+
+# Read master key only (no upstream keys are accessible to this script's user)
+source /etc/ai-fortress/master-key.env
+
+# Resolve the VM's address via libvirt — no mDNS/Avahi dependency.
+VM_IP=$(virsh -c qemu:///system -q domifaddr "$VM_NAME" \
+        | awk '/ipv4/ {sub(/\/.*/,"",$NF); print $NF; exit}')
+[[ -z "$VM_IP" ]] && { echo "could not resolve $VM_NAME IP via virsh" >&2; exit 1; }
+
+# Build the mint request body with jq -n so PROJECT_NAME / USER are passed as
+# data, not interpolated into JSON (avoids quote-injection bugs).
+BODY=$(jq -n \
+  --arg project "$PROJECT_NAME" \
+  --arg user "$USER" \
+  '{models:["claude-*","gpt-*"],
+    max_budget:5.0,
+    duration:"8h",
+    rpm_limit:60,
+    metadata:{project:$project, host_user:$user}}')
 
 # Mint a per-session virtual key
-VIRTUAL_KEY=$(curl -fsS --max-time 5 \
+RESP=$(curl -fsS --max-time 5 \
     -X POST http://127.0.0.1:4000/key/generate \
     -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
     -H "Content-Type: application/json" \
-    -d "$(cat <<JSON
-{
-  "models": ["claude-*", "gpt-*"],
-  "max_budget": 5.0,
-  "duration": "8h",
-  "metadata": {"project": "$PROJECT_NAME", "host_user": "$USER"}
+    -d "$BODY")
+VIRTUAL_KEY=$(jq -r .key <<<"$RESP")
+[[ -z "$VIRTUAL_KEY" || "$VIRTUAL_KEY" == "null" ]] && { echo "mint failed: $RESP" >&2; exit 1; }
+
+# Revoke the key when the launcher exits, regardless of how (Ctrl-C, normal
+# exit, SSH disconnect). TTL would catch it eventually; this is belt-and-suspenders.
+cleanup() {
+  curl -fsS --max-time 5 -X POST http://127.0.0.1:4000/key/delete \
+    -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -nc --arg k "$VIRTUAL_KEY" '{keys:[$k]}')" >/dev/null || true
 }
-JSON
-)" | jq -r .key)
+trap cleanup EXIT
 
 # Hand off to the VM. The virtual key is the ONLY secret crossing into the VM.
-# We pass it via SSH env, not via the command line (avoids ps leakage).
-exec ssh -t \
+# Passed via SSH env, not as a CLI argument, so it doesn't appear in `ps`.
+# Note: not exec'd, so the EXIT trap fires after SSH returns.
+ssh -t \
     -o SendEnv=VIRTUAL_KEY \
     -o ServerAliveInterval=30 \
-    fortress@ai-fortress.local \
+    "$VM_USER@$VM_IP" \
     VIRTUAL_KEY="$VIRTUAL_KEY" /usr/local/bin/agent-vm "$PROJECT_NAME" "$TYPE"
 ```
 
 Key properties:
 
-- The master key is sourced from `upstream.env` (root-readable, or readable by a fortress group member). It never leaves this script's process.
-- The minted virtual key is short-lived (8h), capped ($5), and revocable from the host without touching anything on the VM.
-- The virtual key is passed to the VM as an SSH `SendEnv` value, not as a command-line argument, so it doesn't appear in `ps` output on the VM.
-- The script `exec`s into SSH so Ctrl-C and signal handling work correctly. When the user exits the agent shell, SSH closes, the `docker run` inside ends, and the virtual key (which is timer-bounded anyway) becomes dead weight that LiteLLM will GC.
+- The master key is sourced from `master-key.env` (readable only via the `fortress` group). It never leaves this script's process.
+- The minted virtual key is short-lived (8h), capped ($5), rate-limited to 60 RPM, and revoked immediately on launcher exit.
+- The virtual key is passed to the VM as an SSH `SendEnv` value, not as a CLI argument, so it doesn't appear in `ps` on the VM.
+- The VM IP is resolved each invocation via `virsh domifaddr` — no dependency on mDNS, DHCP reservations, or `/etc/hosts`.
+- `VM_USER` defaults to `$USER` and is overridable via `FORTRESS_VM_USER` so this script is portable across different users provisioning their own VMs.
 
-Optional: on script exit, call `/key/delete` to revoke immediately. Not strictly necessary because of the TTL, but tighter.
-
-### Guest: vsock kernel modules
+### Guest: vsock kernel modules and sshd config
 
 Add to `config.bu`:
 
@@ -288,9 +323,15 @@ storage:
         inline: |
           vsock
           vmw_vsock_virtio_transport
+
+    - path: /etc/ssh/sshd_config.d/10-ai-fortress.conf
+      mode: 0644
+      contents:
+        inline: |
+          AcceptEnv VIRTUAL_KEY
 ```
 
-These are in Flatcar's stock kernel; just need to be loaded at boot. Verify with `lsmod | grep vsock` after reboot.
+The vsock modules are in Flatcar's stock kernel; just need to be loaded at boot. Verify with `lsmod | grep vsock` after reboot. The sshd dropin is what lets the host launcher pass `VIRTUAL_KEY` via `SendEnv` — without `AcceptEnv`, sshd silently drops the variable and the sandbox sees an empty key.
 
 ### Guest: libvirt domain — adding the vsock device
 
@@ -343,7 +384,7 @@ systemd:
           --device /dev/vsock \
           alpine/socat \
           -d \
-          TCP-LISTEN:4000,reuseaddr,fork \
+          TCP-LISTEN:4000,reuseaddr,fork,nodelay \
           VSOCK-CONNECT:2:4000
         ExecStop=/usr/bin/docker stop vsock-shim
 
@@ -396,10 +437,12 @@ exec docker run -it --rm \
 
 Compared to the original `agent-up`:
 
-- All three `-e *_API_KEY` passthroughs from the user shell are gone.
+- All three `-e *_API_KEY` passthroughs from the user shell are gone, including `OPENCODE_API_KEY`. If something inside the sandbox actually needs `OPENCODE_API_KEY`, it'll fail loudly and we can decide then whether to plumb it through; better to break than to keep cruft of unknown purpose.
 - `--network sandbox_net` replaces the implicit default bridge.
 - `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` redirect SDK traffic to the shim.
 - The script reads `VIRTUAL_KEY` from its env (passed by SSH `SendEnv`), not from a CLI arg, so the value never appears in process listings.
+
+**SDK base-URL caveat.** This redirect only works for clients that honor `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` — the official Anthropic and OpenAI Python/TS SDKs do, and so do most wrappers (`litellm`, `instructor`). Hand-rolled HTTP clients, older SDK versions, and a few frameworks that hardcode the API host will instead try to resolve `api.anthropic.com` and fail with a DNS error rather than a clear "blocked" message — because `sandbox_net --internal` has no upstream resolver. If you see DNS errors from inside a sandbox, that's the first thing to check.
 
 ## Bootstrap order
 
@@ -407,28 +450,35 @@ First-time install:
 
 1. **Host:**
    1. Install LiteLLM image: `docker pull ghcr.io/berriai/litellm:main-stable`.
-   2. Create `/etc/ai-fortress/upstream.env` with the three secrets, `chmod 600`.
-   3. Drop in `litellm-config.yaml`, the two systemd units, and the nftables fragment.
-   4. `systemctl enable --now ai-fortress-litellm ai-fortress-vsock-relay`.
-   5. `systemctl reload nftables`.
-   6. Verify: `curl -sS http://127.0.0.1:4000/health`.
-   7. Verify vsock listener: `ss -lx | grep -i vsock` (or `socat -V` then `socat - VSOCK-CONNECT:1:4000` from another shell).
+   2. Create the `fortress` group and add yourself: `sudo groupadd -r fortress && sudo usermod -aG fortress $USER` (then `newgrp fortress` or re-login).
+   3. Generate a master key: `openssl rand -base64 32`. Write it (and the upstream API keys) into `/etc/ai-fortress/upstream.env` (`chmod 600 root:root`). Write the master key alone into `/etc/ai-fortress/master-key.env` (`chmod 640 root:fortress`).
+   4. Drop in `litellm-config.yaml`, the two systemd units, and the nftables fragment.
+   5. `systemctl enable --now ai-fortress-litellm ai-fortress-vsock-relay`.
+   6. `systemctl reload nftables`.
+   7. Verify: `curl -sS http://127.0.0.1:4000/health`.
+   8. Verify vsock listener: `ss -lx | grep -i vsock` (or `socat -V` then `socat - VSOCK-CONNECT:1:4000` from another shell).
 2. **Libvirt:**
    1. `virsh edit ai-fortress`, add the `<vsock>` element with a chosen CID.
    2. `virsh shutdown ai-fortress && virsh start ai-fortress`.
 3. **Guest (Flatcar):**
-   1. Update `config.bu` to add the vsock kernel modules and `vsock-shim.service`. Re-transpile, drop the new `config.json` into libvirt's images dir, re-provision (or for an already-running VM, drop the unit file in via SSH and `systemctl daemon-reload && systemctl enable --now vsock-shim`).
-   2. Create `sandbox_net` if not auto-created: handled by `ExecStartPre` in the unit.
-   3. Drop `agent-vm` into `/usr/local/bin` and `chmod +x`.
+   1. Update `config.bu` to add the vsock kernel modules, the sshd `AcceptEnv` dropin, and `vsock-shim.service`. Re-transpile, drop the new `config.json` into libvirt's images dir, re-provision (or for an already-running VM, drop the unit file and sshd dropin in via SSH, then `systemctl daemon-reload && systemctl enable --now vsock-shim && systemctl reload sshd`).
+   2. Confirm the VM user provisioned in `config.bu` has the same UID as the host user that owns `/projects` source files. Mismatch → virtiofs-mounted writes fail with EPERM. The shipped `config.bu` provisions `ranton`; if you fork this for a different account, change `passwd.users[0].name` to your username and (if your host UID isn't 1000) add an explicit `uid:` field.
+   3. Create `sandbox_net` if not auto-created: handled by `ExecStartPre` in the unit.
+   4. Drop `agent-vm` into `/usr/local/bin` and `chmod +x`.
 4. **Host launcher:**
    1. Drop `~/bin/agent` and `chmod +x`.
-   2. Configure SSH: `~/.ssh/config` entry for `ai-fortress.local` with `SendEnv VIRTUAL_KEY`, and confirm `/etc/ssh/sshd_config` on the VM has `AcceptEnv VIRTUAL_KEY`.
+   2. Optional: if your VM SSH user differs from `$USER`, set `FORTRESS_VM_USER=...` in your shell rc. The launcher discovers the VM IP via `virsh domifaddr` so no `~/.ssh/config` host entry is required.
 
 ## Verification plan
 
 End-to-end smoke test, in order:
 
 ```bash
+# 0. Resolve VM (same way the launcher does)
+VM_IP=$(virsh -c qemu:///system -q domifaddr ai-fortress \
+        | awk '/ipv4/ {sub(/\/.*/,"",$NF); print $NF; exit}')
+VM_USER="${FORTRESS_VM_USER:-$USER}"
+
 # 1. Host proxy is up
 curl -fsS http://127.0.0.1:4000/health | jq
 
@@ -436,14 +486,14 @@ curl -fsS http://127.0.0.1:4000/health | jq
 ss -l | grep -i vsock        # or: socat -u VSOCK-LISTEN:9999 - <<<test (in another shell)
 
 # 3. Guest can reach host over vsock
-ssh fortress@ai-fortress.local 'docker run --rm --device /dev/vsock alpine/socat - VSOCK-CONNECT:2:4000 <<<""'
+ssh "$VM_USER@$VM_IP" 'docker run --rm --device /dev/vsock alpine/socat - VSOCK-CONNECT:2:4000 <<<""'
 
 # 4. Guest shim resolves and proxies
-ssh fortress@ai-fortress.local \
+ssh "$VM_USER@$VM_IP" \
   'docker run --rm --network sandbox_net curlimages/curl curl -fsS http://authproxy:4000/health'
 
 # 5. Sandbox cannot reach the open internet
-ssh fortress@ai-fortress.local \
+ssh "$VM_USER@$VM_IP" \
   'docker run --rm --network sandbox_net curlimages/curl curl --max-time 5 https://example.com' \
   && echo "FAIL: sandbox reached internet" || echo "OK: sandbox blocked"
 
@@ -486,6 +536,8 @@ host/
   ai-fortress-litellm.service
   ai-fortress-vsock-relay.service
   ai-fortress.nft
+  upstream.env.example        # template; daemon-only secrets file
+  master-key.env.example      # template; launcher-readable (fortress group)
   agent                       # the new launcher; goes in user's ~/bin
   README-host-install.md      # the one-time install steps above
 
@@ -493,13 +545,14 @@ vm/
   agent-vm                    # goes in /usr/local/bin inside the VM
   vsock-shim.service          # also embedded in config.bu
 
-config.bu                     # MODIFIED: add vsock-shim.service unit + vsock modules-load.d
+config.bu                     # MODIFIED: add vsock-shim.service unit, vsock modules-load.d,
+                              # sshd_config.d/10-ai-fortress.conf (AcceptEnv VIRTUAL_KEY)
 do_virt_install.sh            # MODIFIED: add --qemu-commandline for vsock device, OR document virsh edit step
 ```
 
 Files to delete or supersede:
 
-- `agent-up` — replaced by `host/agent` + `vm/agent-vm`. Keep around for one release as a deprecated path, then remove.
+- `agent-up` — replaced by `host/agent` + `vm/agent-vm`. The new path drops `OPENCODE_API_KEY` along with the other key passthroughs. Keep `agent-up` around for one release as a deprecated path, then remove.
 
 Files NOT touched:
 
@@ -515,5 +568,5 @@ Files NOT touched:
 4. **VM access without SSH.** SSH is the path of least resistance for the launcher → VM hop, but it adds an SSH dependency. Alternatives: virtio-serial channel + a tiny dispatcher daemon inside the VM, or `virsh qemu-agent-command` if the QEMU guest agent is installed. SSH is fine for v1.
 5. **Image pinning.** The systemd units pin LiteLLM by tag (`main-stable`) and the shim by `alpine/socat` tag-less. Pin both by digest (`@sha256:...`) before this is "production." A compromised proxy image is a credential compromise.
 6. **vsock relay HA.** If `ai-fortress-vsock-relay.service` dies, sandboxes stall on their next request. systemd `Restart=always` covers process crashes; for harder failures, add a healthcheck that probes `socat - VSOCK-CONNECT:2:4000` from inside the VM and alerts.
-7. **Cleanup on session exit.** The launcher could trap EXIT to call `/key/delete` immediately, in addition to the natural TTL expiry. Belt and suspenders.
-8. **Audit logging.** LiteLLM writes request logs to its SQLite DB. Tail those into your normal log pipeline and you have a full audit trail of every prompt every sandbox sent — useful both for debugging and for spotting weirdness after the fact.
+7. **Audit logging.** LiteLLM writes request logs to its SQLite DB. Tail those into your normal log pipeline and you have a full audit trail of every prompt every sandbox sent — useful both for debugging and for spotting weirdness after the fact.
+8. **Orphan key sweep on `burn_it_down.sh`.** The launcher's EXIT trap revokes the key for normal shutdown paths, but a hard `kill -9` of the launcher (or burning the VM out from under a still-running sandbox) leaves the key alive until its TTL. A small systemd timer that lists keys via `/key/info` and deletes any without an active SSH session would close that gap.

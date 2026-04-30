@@ -118,10 +118,23 @@ A green run on all three is the definition of "Phase complete."
 ## Usage
 
 ```bash
-agent <project-folder-name> [python|default|<your-image>]
+agent <project> [python|default]                       # built-in image alias
+agent <project> --image <tag>                          # any image
+agent <project> --image <tag> --env KEY=VAL --env ...  # plus extra env passthrough
 ```
 
-`agent` mints a per-session virtual key, SSHes into the VM, and starts a gVisor-trapped container scoped to `/projects/<project>`. The agent inside the container talks to `authproxy:4000` instead of `api.anthropic.com`; the sandbox has no other network egress. On exit, the virtual key is revoked. Stale keys (e.g. after `kill -9`) are reaped within ~5 minutes by the `ai-fortress-key-sweep.timer`.
+`agent` mints a per-session virtual key, SSHes into the VM, and starts a gVisor-trapped container scoped to `/projects/<project>`. The container always uses fortress controls — `runsc`, `sandbox_net --internal`, no upstream API key (only the virtual key), `HOME=/work`. The agent inside it talks to `authproxy:4000` instead of `api.anthropic.com`; the sandbox has no other network egress. On exit, the virtual key is revoked.
+
+`--image` lets layered projects use their own container without writing a parallel launcher. `--env` passes additional env vars into the sandbox (e.g., a worker's `REPO_NAME` or per-project auth tokens). The sensitive secrets (Bifrost admin password, upstream API keys) never leave the host regardless of what's passed.
+
+### Exposing additional host services to the sandbox
+
+The sandbox bridge is `--internal`, so the only thing reachable from inside is what the fortress explicitly exposes via a labelled vsock-shim container. By default that's just `authproxy` (the LLM proxy). To add another exposed host service — e.g. a coordinator that the worker container needs to poll — drop in a matched pair of systemd units:
+
+- **Host:** `socat VSOCK-LISTEN:<port>,fork TCP:127.0.0.1:<port>` (so the host service must bind 127.0.0.1, not 0.0.0.0).
+- **VM:** a `socat` container in `sandbox_net` with `--label ai-fortress.shim.alias=<name>` and `--device /dev/vsock --security-opt seccomp=unconfined`, listening TCP and connecting to `VSOCK-CONNECT:2:<port>`.
+
+`agent-vm` auto-discovers labelled shim containers and adds `--add-host <name>:<ip>` to every sandbox. So once both units are enabled, the sandbox container can resolve `<name>` and reach the host service through the vsock channel — no agent-vm change needed. See `ARCHITECTURE.md` for templates.
 
 ### Image management
 

@@ -1,41 +1,98 @@
 #!/bin/bash
 # In-VM launcher. Install at /opt/bin/agent-vm, chmod +x.
 # (/usr is read-only on Flatcar; /opt/bin is the conventional writable bin dir.)
-# Invoked over SSH by the host-side `agent` launcher with VIRTUAL_KEY in env.
+#
+# Usage:
+#   agent-vm <project> [type] [--image IMG] [--env KEY=VAL]...
+#
+# Always launches the sandbox under runsc on sandbox_net with the standard
+# fortress controls: virtual-key auth, --internal egress, label=disable,
+# HOME=/work, ANTHROPIC_BASE_URL/OPENAI_BASE_URL pointed at the proxy.
+#
+# Discovers all sandbox_net shim containers carrying the label
+# `ai-fortress.shim.alias=NAME` and exposes each as --add-host NAME:<ip>.
+# That makes adding new exposed host services (e.g. a code-workers
+# coordinator) a configuration concern: enable a shim+relay pair on the
+# VM/host, no agent-vm change needed.
 set -euo pipefail
 
-PROJECT_NAME="$1"
-TYPE="${2:-default}"
-PROJECT_PATH="/projects/$PROJECT_NAME"
+PROJECT_NAME=""
+TYPE="default"
+IMAGE=""
+declare -a EXTRA_ENVS=()
 
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --image)    IMAGE="$2"; shift 2 ;;
+    --image=*)  IMAGE="${1#--image=}"; shift ;;
+    -e|--env)   EXTRA_ENVS+=("$2"); shift 2 ;;
+    --env=*)    EXTRA_ENVS+=("${1#--env=}"); shift ;;
+    -*) echo "unknown flag: $1" >&2; exit 2 ;;
+    *)
+      if [[ -z "$PROJECT_NAME" ]]; then PROJECT_NAME="$1"
+      else TYPE="$1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+[[ -z "$PROJECT_NAME" ]]    && { echo "usage: agent-vm <project> [type] [--image IMG] [--env KEY=VAL]..." >&2; exit 1; }
 [[ -z "${VIRTUAL_KEY:-}" ]] && { echo "VIRTUAL_KEY env not set" >&2; exit 1; }
 
-case "$TYPE" in
-  python) IMAGE="ai-fortress/python-dev:latest" ;;
-  *)      IMAGE="ghcr.io/anomalyco/opencode:latest" ;;
-esac
+PROJECT_PATH="/projects/$PROJECT_NAME"
+
+# Image resolution: explicit --image wins; otherwise map TYPE to a built-in.
+if [[ -z "$IMAGE" ]]; then
+  case "$TYPE" in
+    python)         IMAGE="ai-fortress/python-dev:latest" ;;
+    default|"")     IMAGE="ghcr.io/anomalyco/opencode:latest" ;;
+    *)              echo "unknown type '$TYPE' (use --image to specify a custom image)" >&2; exit 2 ;;
+  esac
+fi
 
 USER_FLAGS="--user $(id -u):$(id -g)"
 
-# runsc's netstack cannot reach Docker's embedded DNS resolver at 127.0.0.11,
-# so the "authproxy" alias on sandbox_net does not resolve from inside an
-# --runtime=runsc container. Look up the shim's IP and inject it as a
-# /etc/hosts entry instead.
-SHIM_IP=$(docker inspect vsock-shim --format '{{ range .NetworkSettings.Networks }}{{ .IPAddress }}{{ end }}' 2>/dev/null)
-[[ -z "$SHIM_IP" ]] && { echo "could not resolve vsock-shim IP — is it running?" >&2; exit 1; }
+# --- Auto-discover labelled shims and build --add-host flags ----------------
+declare -a HOST_FLAGS=()
+mapfile -t SHIM_CIDS < <(docker ps -q --filter "label=ai-fortress.shim.alias")
+for cid in "${SHIM_CIDS[@]}"; do
+  alias=$(docker inspect "$cid" --format '{{ index .Config.Labels "ai-fortress.shim.alias" }}')
+  ip=$(docker inspect "$cid" --format '{{ range .NetworkSettings.Networks }}{{ .IPAddress }}{{ end }}')
+  if [[ -n "$alias" && -n "$ip" ]]; then
+    HOST_FLAGS+=( --add-host "$alias:$ip" )
+  fi
+done
 
-exec docker run -it --rm \
-  $USER_FLAGS \
-  --name "agent-$PROJECT_NAME-$(date +%s)" \
-  --runtime=runsc \
-  --network sandbox_net \
-  --add-host "authproxy:$SHIM_IP" \
-  --security-opt label=disable \
-  -v "$PROJECT_PATH:/work" \
-  -w /work \
-  -e HOME=/work \
-  -e ANTHROPIC_BASE_URL=http://authproxy:4000/anthropic \
-  -e ANTHROPIC_API_KEY="$VIRTUAL_KEY" \
-  -e OPENAI_BASE_URL=http://authproxy:4000/openai/v1 \
-  -e OPENAI_API_KEY="$VIRTUAL_KEY" \
-  "$IMAGE"
+# Sanity: authproxy must be reachable, otherwise the fortress proxy isn't usable.
+if ! printf '%s\n' "${HOST_FLAGS[@]}" | grep -q '^--add-host$' \
+   || ! printf '%s\n' "${HOST_FLAGS[@]}" | grep -q '^authproxy:'; then
+  echo "WARNING: no shim labelled 'authproxy' found; LLM calls will fail" >&2
+fi
+
+# --- Extra env vars passed in via --env ------------------------------------
+declare -a ENV_FLAGS=()
+for env in "${EXTRA_ENVS[@]}"; do
+  ENV_FLAGS+=( -e "$env" )
+done
+
+# --- Compose and exec the docker run ---------------------------------------
+declare -a CMD=( docker run -it --rm
+  $USER_FLAGS
+  --name "agent-$PROJECT_NAME-$(date +%s)"
+  --runtime=runsc
+  --network sandbox_net
+  --security-opt label=disable
+  -v "$PROJECT_PATH:/work"
+  -w /work
+  -e HOME=/work
+  -e ANTHROPIC_BASE_URL=http://authproxy:4000/anthropic
+  -e ANTHROPIC_API_KEY="$VIRTUAL_KEY"
+  -e OPENAI_BASE_URL=http://authproxy:4000/openai/v1
+  -e OPENAI_API_KEY="$VIRTUAL_KEY"
+)
+(( ${#HOST_FLAGS[@]} > 0 )) && CMD+=( "${HOST_FLAGS[@]}" )
+(( ${#ENV_FLAGS[@]} > 0 ))  && CMD+=( "${ENV_FLAGS[@]}" )
+CMD+=( "$IMAGE" )
+
+exec "${CMD[@]}"

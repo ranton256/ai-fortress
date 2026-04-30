@@ -12,6 +12,7 @@ ExecStartPre=/bin/sh -c '/usr/bin/docker network inspect sandbox_net >/dev/null 
 ExecStart=/usr/bin/docker run --rm --name vsock-shim \
   --network sandbox_net \
   --network-alias authproxy \
+  --label ai-fortress.shim.alias=authproxy \
   --device /dev/vsock \
   --security-opt seccomp=unconfined \
   alpine/socat@sha256:ca728ccb1eabd4850ee9063d50e1899a0171bdd9002f7a4126f2925578331063 \

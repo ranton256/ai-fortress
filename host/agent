@@ -1,20 +1,69 @@
 #!/bin/bash
 # Host-side launcher. Install at ~/bin/agent, chmod +x.
-# Mints a per-session virtual key via sudo, then SSHes into the VM with
-# VIRTUAL_KEY in the environment. The master key never touches this process.
+#
+# Usage:
+#   agent <project> [type|--image IMG] [--env KEY=VAL]...
+#
+# Mints a per-session virtual key, then SSHes into the VM and invokes
+# /opt/bin/agent-vm with the same args. The launcher's only credential is
+# VIRTUAL_KEY (sent via SSH SendEnv); --image and --env values pass as CLI
+# args. The master Bifrost admin password never enters this process.
+#
+# Examples:
+#   agent rhizome                                   # default opencode image
+#   agent rhizome python                            # python-dev image
+#   agent rhizome --image my-thing/foo:latest       # any image
+#   agent rhizome --image worker:latest --env REPO_NAME=rhizome --env FOO=bar
 set -euo pipefail
 
-PROJECT_NAME="${1:-}"
-TYPE="${2:-default}"
-[[ -z "$PROJECT_NAME" ]] && { echo "usage: agent <project> [python|default]" >&2; exit 1; }
+PROJECT_NAME=""
+TYPE="default"
+IMAGE=""
+declare -a EXTRA_ENVS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --image)    IMAGE="$2"; shift 2 ;;
+    --image=*)  IMAGE="${1#--image=}"; shift ;;
+    -e|--env)   EXTRA_ENVS+=("$2"); shift 2 ;;
+    --env=*)    EXTRA_ENVS+=("${1#--env=}"); shift ;;
+    -h|--help)
+      cat <<'EOF'
+usage: agent <project> [type|--image IMG] [--env KEY=VAL]...
+
+Launches a sandboxed container scoped to /projects/<project> on the VM.
+
+Positional:
+  project  Subdirectory of /home/$USER/projects bind-mounted into the sandbox.
+  type     Built-in image alias: 'default' (opencode), 'python' (python-dev).
+           Ignored if --image is set.
+
+Flags:
+  --image IMAGE    Use this image instead of the type-mapped default.
+  --env KEY=VAL    Pass an env var into the sandbox container. Repeatable.
+
+The sandbox always runs under runsc on sandbox_net with --internal, holds
+only a per-session sk-bf-* virtual key (no upstream API key), and has
+HOME=/work. Additional host services exposed via labelled vsock-shim
+containers are auto-wired into the sandbox's /etc/hosts.
+EOF
+      exit 0 ;;
+    -*) echo "unknown flag: $1" >&2; exit 2 ;;
+    *)
+      if [[ -z "$PROJECT_NAME" ]]; then PROJECT_NAME="$1"
+      else TYPE="$1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+[[ -z "$PROJECT_NAME" ]] && { echo "usage: agent <project> [type|--image IMG] [--env KEY=VAL]..." >&2; exit 1; }
 
 VM_NAME="${FORTRESS_VM_NAME:-ai-fortress}"
 VM_USER="${FORTRESS_VM_USER:-$USER}"
 
 resolve_vm_ip() {
-  # Filter out 127.0.0.0/8 — when qemu-guest-agent isn't running (Flatcar
-  # doesn't ship it), --source agent reports the VM's lo address, which
-  # would steer SSH at the host's sshd. Fall through to the DHCP lease.
   local _filter='/ipv4/ {sub(/\/.*/,"",$NF); ip=$NF; if (ip !~ /^127\./) {print ip; exit}}'
   local tries=0 ip
   while (( tries < 20 )); do
@@ -34,11 +83,8 @@ resolve_vm_ip() {
 
 VM_IP=$(resolve_vm_ip) || { echo "could not resolve $VM_NAME IP after 20s" >&2; exit 1; }
 
-# Capture launcher identity for the sweeper. PID + start-time-ns is unique
-# enough on this host: even with PID reuse after reboot, start-ns resets.
 LPID=$$
 LSTART=$(awk '{print $22}' "/proc/$$/stat")
-
 VIRTUAL_KEY=$(sudo -n /usr/local/sbin/fortress-mint "$PROJECT_NAME" "$LPID" "$LSTART")
 
 cleanup() {
@@ -46,8 +92,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Build the agent-vm argv: positional first, then flags.
+declare -a AVM_ARGS=( "$PROJECT_NAME" "$TYPE" )
+[[ -n "$IMAGE" ]] && AVM_ARGS+=( --image "$IMAGE" )
+for env in "${EXTRA_ENVS[@]}"; do
+  AVM_ARGS+=( --env "$env" )
+done
+
+# Quote each arg for safe transit through ssh's command-string concat.
+remote_cmd="/opt/bin/agent-vm"
+for a in "${AVM_ARGS[@]}"; do
+  remote_cmd+=" $(printf '%q' "$a")"
+done
+
 ssh -t \
     -o SendEnv=VIRTUAL_KEY \
     -o ServerAliveInterval=30 \
     "$VM_USER@$VM_IP" \
-    VIRTUAL_KEY="$VIRTUAL_KEY" /opt/bin/agent-vm "$PROJECT_NAME" "$TYPE"
+    VIRTUAL_KEY="$VIRTUAL_KEY" "$remote_cmd"

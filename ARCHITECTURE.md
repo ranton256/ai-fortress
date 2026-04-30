@@ -240,8 +240,27 @@ Secrets only flow downward, one tier at a time, and only the minimum required at
 | Compromised Bifrost image | Upstream keys, master password, internet on 443/53 | Image pinned by digest. nftables `skuid 1500` confines the container to 53/udp + 443/tcp only |
 | Stolen virtual key (logged somewhere) | LLM API access for ≤ 8h, ≤ $5 | Soft TTL via sweeper; budget cap; manual revoke via `sudo fortress-revoke <key>` |
 | Stolen master password | Equivalent to upstream-key compromise (mint unlimited keys) | Master password readable only as root or via the two helper scripts. A host-root compromise is required |
+| **Sandbox uses Claude's server-side tools (`web_fetch`, `web_search`, `code_execution`) to act outside the sandbox** | Whatever the upstream model's server-side tools can reach: the public web, a Python execution sandbox on Anthropic's infrastructure, etc. | **None at the network layer.** The fortress draws boundaries at networking and syscalls; neither notices a tool-use block traveling inside a legitimate Messages API request. See "LLM-as-egress channel" below for mitigations. |
 | KVM escape | Host workstation | Out of scope — fortress was always advertised as ending here |
 | Compromised host | Everything | Out of scope |
+
+### LLM-as-egress channel (the model's own tools)
+
+The fortress isolates *the agent process* from the public network. It does not — and cannot, at the network layer — isolate the *model*. Claude (and any LLM) ships with capabilities the SDK can advertise to it: `web_fetch_20250910`, `web_search_20250305`, `code_execution_20250825`, and the like. When a client (e.g. OpenCode) lists those tools in the `tools` array of a Messages API request, the model can invoke them, and the work happens on Anthropic's infrastructure. The result is returned in the same response.
+
+From the sandbox's network namespace, only one TCP connection ever existed (to `authproxy:4000`), and our `B3-1`/`B3-2` blocked-path tests still pass: nothing in the sandbox can directly reach the internet. But via the LLM's tool-use channel, the agent effectively had access to:
+
+- Arbitrary web pages, fetched and converted to text (`web_fetch`)
+- The public web search index (`web_search`)
+- A Python execution environment (`code_execution`)
+
+Three layers of mitigation, weakest to strongest:
+
+1. **Application posture (cheapest, fastest, easy to bypass).** Configure the agent (OpenCode in our case) to *not advertise* these tools. If the tool isn't in the request's `tools` array, the model can't invoke it. This is per-application config, and a different agent — or a misconfigured one — would re-introduce the channel.
+2. **Proxy-level scrub (defense-in-depth).** Strip server-side tools from the request body inside Bifrost (or a small middleware in front of it) before it goes upstream. A workstation-wide policy that no agent can bypass by changing its own config. Bifrost's governance plugin has a `PreLLMHook` that's the natural place; ~30 lines of Go for a strip-tools rewrite. Recommended if this class of leak matters to your threat model.
+3. **Model/deployment choice.** Some Anthropic deployments don't expose server-side tools. Less flexible than the proxy filter but doesn't depend on a filter being maintained.
+
+This caveat is general — it applies to any LLM gateway, any agent, and any provider that exposes server-side tools. The fortress's existing controls are still load-bearing for *every other* exfil path; this just identifies the one channel that lives at a layer above the network.
 
 ---
 
@@ -286,6 +305,7 @@ These are the things that surfaced during implementation and don't appear in `ne
 
 ## Known limitations / future work
 
+0. **LLM-as-egress channel.** Server-side LLM tools (`web_fetch`, `web_search`, `code_execution`) bypass the network sandbox entirely; they are tool-use blocks inside a legitimate Messages API call. See the "LLM-as-egress channel" section under Threat model for mitigations. Application-level fix: don't advertise the tools to the model. Proxy-level fix: strip them from the request body in Bifrost.
 1. **No SNI-based egress filtering at the host.** UID 1500 can reach any HTTPS host. Tightening would require a userspace SNI filter (mitmproxy or sslh) or a per-process netns. Tracked.
 2. **Strict forward-chain mode** is opt-in (commented out in `host/ai-fortress.nft`). Enabling it removes the VM's own internet access (breaks `docker pull` from inside the VM), and in return removes the relaxed-mode caveat in the threat model.
 3. **runsc DNS** is bypassed via `--add-host`; if the shim's IP rotates (it doesn't in normal operation, but it could after `docker network prune`), `agent-vm` re-resolves it on each launch.
@@ -294,6 +314,70 @@ These are the things that surfaced during implementation and don't appear in `ne
 6. **Image pinning by digest** is in place for both `litellm/litellm` and `alpine/socat`, but `curlimages/curl` (used by the verify scripts) is tag-only. Verifier tests are not load-bearing for security; not pinning is acceptable.
 
 ---
+
+## Adding additional exposed host services (layered projects)
+
+The sandbox bridge is `--internal`, and the only egress is via labelled vsock-shim containers. Default install ships one shim — `authproxy` for the LLM proxy. Layered projects (e.g. code-workers, which needs a host coordinator reachable from the worker container) add their own shim+relay pair without touching `agent-vm`.
+
+The mechanism is a Docker label. Any container in `sandbox_net` with `--label ai-fortress.shim.alias=NAME` is auto-discovered by `agent-vm` and exposed to every sandbox via `--add-host NAME:<ip>`. The decision of *which* services exist in any given fortress install is configuration: it's the set of shim systemd units enabled on the VM (and matching relay units on the host).
+
+### Pattern: expose a host service `foo` listening on host `127.0.0.1:7222` to the sandbox as `foo:7222`
+
+**On the host** (a new systemd unit, e.g. `host/ai-fortress-vsock-relay-foo.service`):
+
+```ini
+[Unit]
+Description=AI Fortress vsock relay for foo (port 7222)
+After=network-online.target
+
+[Service]
+Restart=always
+RestartSec=2
+ExecStart=/usr/bin/socat -ly \
+  VSOCK-LISTEN:7222,reuseaddr,fork \
+  TCP:127.0.0.1:7222,nodelay
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Inside the VM** (a new systemd unit, e.g. `vm/foo-shim.service`, or embedded in a layered project's `config.bu`):
+
+```ini
+[Unit]
+Description=foo shim (TCP -> vsock)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Restart=always
+RestartSec=5
+ExecStartPre=-/usr/bin/docker rm -f foo-shim
+ExecStart=/usr/bin/docker run --rm --name foo-shim \
+  --network sandbox_net \
+  --network-alias foo \
+  --label ai-fortress.shim.alias=foo \
+  --device /dev/vsock \
+  --security-opt seccomp=unconfined \
+  alpine/socat@sha256:ca728ccb1eabd4850ee9063d50e1899a0171bdd9002f7a4126f2925578331063 \
+  -ly \
+  TCP-LISTEN:7222,reuseaddr,fork,nodelay \
+  VSOCK-CONNECT:2:7222
+ExecStop=/usr/bin/docker stop foo-shim
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Pre-condition on the host:** the `foo` service must bind `127.0.0.1:7222` (not `0.0.0.0`). The relay only forwards from vsock to host loopback; if the host service is already on loopback only, the relay is the only path in and the LAN can't reach it.
+
+**Sandbox visibility:** sandbox containers reach `foo:7222` via the auto-injected `--add-host foo:<shim_ip>`. Resolution happens via `/etc/hosts` (not Docker DNS, which doesn't work under runsc).
+
+The fortress's threat-model invariants still hold: the only IP-network egress remains via labelled shims, and each labelled shim corresponds to a specific host service explicitly chosen at install time.
 
 ## Glossary
 

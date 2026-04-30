@@ -154,7 +154,7 @@ B2-4 is the one most likely to surprise you — confirm it explicitly. The threa
 
 ## Phase 3 — Launcher end-to-end (`agent`, `agent-vm`)
 
-After dropping `~/bin/agent` and `/usr/local/bin/agent-vm` into place.
+After dropping `~/bin/agent` and `/opt/bin/agent-vm` into place. (Flatcar's `/usr` is read-only; `/opt/bin` is the conventional writable bin dir, also used by `runsc`.)
 
 ### Phase 3 allowed (A)
 

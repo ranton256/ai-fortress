@@ -33,6 +33,20 @@ storage:
         inline: |
           AcceptEnv VIRTUAL_KEY
 
+    # Register gVisor (runsc) as a Docker runtime so `--runtime=runsc` works.
+    # The runsc binary itself is installed by install-gvisor.service.
+    - path: /etc/docker/daemon.json
+      mode: 0644
+      contents:
+        inline: |
+          {
+            "runtimes": {
+              "runsc": {
+                "path": "/opt/bin/runsc"
+              }
+            }
+          }
+
 systemd:
   units:
     # Mount the 'host_projects' share from the host to /projects

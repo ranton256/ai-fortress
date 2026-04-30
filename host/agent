@@ -50,4 +50,4 @@ ssh -t \
     -o SendEnv=VIRTUAL_KEY \
     -o ServerAliveInterval=30 \
     "$VM_USER@$VM_IP" \
-    VIRTUAL_KEY="$VIRTUAL_KEY" /usr/local/bin/agent-vm "$PROJECT_NAME" "$TYPE"
+    VIRTUAL_KEY="$VIRTUAL_KEY" /opt/bin/agent-vm "$PROJECT_NAME" "$TYPE"

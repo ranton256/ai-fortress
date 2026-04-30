@@ -1,5 +1,6 @@
 #!/bin/bash
-# In-VM launcher. Install at /usr/local/bin/agent-vm, chmod +x.
+# In-VM launcher. Install at /opt/bin/agent-vm, chmod +x.
+# (/usr is read-only on Flatcar; /opt/bin is the conventional writable bin dir.)
 # Invoked over SSH by the host-side `agent` launcher with VIRTUAL_KEY in env.
 set -euo pipefail
 
@@ -16,11 +17,19 @@ esac
 
 USER_FLAGS="--user $(id -u):$(id -g)"
 
+# runsc's netstack cannot reach Docker's embedded DNS resolver at 127.0.0.11,
+# so the "authproxy" alias on sandbox_net does not resolve from inside an
+# --runtime=runsc container. Look up the shim's IP and inject it as a
+# /etc/hosts entry instead.
+SHIM_IP=$(docker inspect vsock-shim --format '{{ range .NetworkSettings.Networks }}{{ .IPAddress }}{{ end }}' 2>/dev/null)
+[[ -z "$SHIM_IP" ]] && { echo "could not resolve vsock-shim IP — is it running?" >&2; exit 1; }
+
 exec docker run -it --rm \
   $USER_FLAGS \
   --name "agent-$PROJECT_NAME-$(date +%s)" \
   --runtime=runsc \
   --network sandbox_net \
+  --add-host "authproxy:$SHIM_IP" \
   --security-opt label=disable \
   -v "$PROJECT_PATH:/work" \
   -w /work \

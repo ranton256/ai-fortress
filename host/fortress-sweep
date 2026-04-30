@@ -1,0 +1,29 @@
+#!/bin/bash
+# Reap LiteLLM virtual keys whose owning launcher PID is gone.
+# Install at /usr/local/sbin/fortress-sweep, mode 0750, owner root:root.
+# Run by ai-fortress-key-sweep.timer every 5 minutes.
+set -euo pipefail
+
+# shellcheck disable=SC1091
+source /etc/ai-fortress/upstream.env
+
+KEYS=$(curl -fsS --max-time 10 \
+    -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+    "http://127.0.0.1:4000/key/info?return_full_object=true" || true)
+
+[[ -z "$KEYS" ]] && exit 0
+
+jq -c '.keys[]? | select(.metadata.launcher_pid != null)' <<<"$KEYS" \
+| while read -r entry; do
+    KEY_TOKEN=$(jq -r .token <<<"$entry")
+    LPID=$(jq -r '.metadata.launcher_pid'          <<<"$entry")
+    LSTART=$(jq -r '.metadata.launcher_pid_start_ns' <<<"$entry")
+
+    # If the PID still exists AND its start-time matches, the launcher is alive.
+    if [[ -r "/proc/$LPID/stat" ]]; then
+      CUR_START=$(awk '{print $22}' "/proc/$LPID/stat" 2>/dev/null || echo 0)
+      [[ "$CUR_START" == "$LSTART" ]] && continue
+    fi
+
+    /usr/local/sbin/fortress-revoke "$KEY_TOKEN" || true
+  done

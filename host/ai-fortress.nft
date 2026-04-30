@@ -1,0 +1,43 @@
+#!/usr/sbin/nft -f
+# AI Fortress egress allowlist.
+# Install at /etc/nftables.d/ai-fortress.nft and either include from /etc/sysconfig/nftables.conf
+# or load directly with: nft -f /etc/nftables.d/ai-fortress.nft
+#
+# Idempotent: drops the table first if it exists.
+
+table inet ai_fortress
+delete table inet ai_fortress
+
+table inet ai_fortress {
+    # Trusted UID for the LiteLLM container. Must match the --user flag on
+    # ai-fortress-litellm.service and the system user created by:
+    #   useradd --system --no-create-home --shell /usr/sbin/nologin --uid 1500 litellm
+    define litellm_uid = 1500
+
+    chain output {
+        type filter hook output priority 0; policy accept;
+
+        # LiteLLM is allowed to do DNS and HTTPS only.
+        # Everything else originating from this UID is dropped — note the
+        # *drop* at the end of this UID's stanza, not at the end of the chain.
+        meta skuid $litellm_uid udp dport 53 accept
+        meta skuid $litellm_uid tcp dport 443 accept
+        meta skuid $litellm_uid drop
+
+        # All other host traffic is unaffected (default accept policy).
+    }
+
+    chain forward {
+        type filter hook forward priority 0; policy accept;
+
+        # Relaxed mode (default): VM userspace keeps internet access for
+        # image pulls and OS updates. Sandbox isolation is enforced inside
+        # the VM via Docker's --internal network, not at this hook.
+        #
+        # For strict mode, uncomment the rule below to drop all VM egress
+        # via libvirt NAT. This breaks `docker pull` and `dnf update`
+        # inside the VM — only enable if you've automated image refresh.
+        #
+        # iifname "virbr0" oifname != "virbr0" drop
+    }
+}

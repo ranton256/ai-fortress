@@ -1,0 +1,23 @@
+[Unit]
+Description=AI Fortress vsock shim (TCP -> vsock)
+After=docker.service projects.mount
+Requires=docker.service
+
+[Service]
+Restart=always
+RestartSec=5
+ExecStartPre=-/usr/bin/docker rm -f vsock-shim
+ExecStartPre=/bin/sh -c '/usr/bin/docker network inspect sandbox_net >/dev/null 2>&1 || \
+  /usr/bin/docker network create --driver bridge --internal sandbox_net'
+ExecStart=/usr/bin/docker run --rm --name vsock-shim \
+  --network sandbox_net \
+  --network-alias authproxy \
+  --device /dev/vsock \
+  alpine/socat@sha256:ca728ccb1eabd4850ee9063d50e1899a0171bdd9002f7a4126f2925578331063 \
+  -ly \
+  TCP-LISTEN:4000,reuseaddr,fork,nodelay \
+  VSOCK-CONNECT:2:4000
+ExecStop=/usr/bin/docker stop vsock-shim
+
+[Install]
+WantedBy=multi-user.target

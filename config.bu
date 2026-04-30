@@ -17,6 +17,22 @@ storage:
       contents:
         inline: ai-fortress-general
 
+    # Load vsock kernel modules at boot so the in-VM shim can open /dev/vsock.
+    - path: /etc/modules-load.d/vsock.conf
+      mode: 0644
+      contents:
+        inline: |
+          vsock
+          vmw_vsock_virtio_transport
+
+    # Allow the host-side agent launcher to pass VIRTUAL_KEY via SendEnv.
+    # Without this, sshd silently drops the variable and the sandbox sees an empty key.
+    - path: /etc/ssh/sshd_config.d/10-ai-fortress.conf
+      mode: 0644
+      contents:
+        inline: |
+          AcceptEnv VIRTUAL_KEY
+
 systemd:
   units:
     # Mount the 'host_projects' share from the host to /projects
@@ -47,5 +63,36 @@ systemd:
         ExecStart=/usr/bin/curl -L https://storage.googleapis.com/gvisor/releases/release/latest/x86_64/runsc -o /opt/bin/runsc
         ExecStart=/usr/bin/chmod +x /opt/bin/runsc
         RemainAfterExit=yes
+        [Install]
+        WantedBy=multi-user.target
+
+    # vsock shim: bridges TCP traffic on the internal sandbox_net to the
+    # host's vsock listener (CID 2:4000). Sandboxes reach the LiteLLM proxy
+    # via "authproxy:4000" on this bridge. Pin the alpine/socat digest before
+    # treating this as production.
+    - name: vsock-shim.service
+      enabled: true
+      contents: |
+        [Unit]
+        Description=AI Fortress vsock shim (TCP -> vsock)
+        After=docker.service projects.mount
+        Requires=docker.service
+
+        [Service]
+        Restart=always
+        RestartSec=5
+        ExecStartPre=-/usr/bin/docker rm -f vsock-shim
+        ExecStartPre=/bin/sh -c '/usr/bin/docker network inspect sandbox_net >/dev/null 2>&1 || \
+          /usr/bin/docker network create --driver bridge --internal sandbox_net'
+        ExecStart=/usr/bin/docker run --rm --name vsock-shim \
+          --network sandbox_net \
+          --network-alias authproxy \
+          --device /dev/vsock \
+          alpine/socat@sha256:ca728ccb1eabd4850ee9063d50e1899a0171bdd9002f7a4126f2925578331063 \
+          -ly \
+          TCP-LISTEN:4000,reuseaddr,fork,nodelay \
+          VSOCK-CONNECT:2:4000
+        ExecStop=/usr/bin/docker stop vsock-shim
+
         [Install]
         WantedBy=multi-user.target

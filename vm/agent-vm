@@ -1,0 +1,31 @@
+#!/bin/bash
+# In-VM launcher. Install at /usr/local/bin/agent-vm, chmod +x.
+# Invoked over SSH by the host-side `agent` launcher with VIRTUAL_KEY in env.
+set -euo pipefail
+
+PROJECT_NAME="$1"
+TYPE="${2:-default}"
+PROJECT_PATH="/projects/$PROJECT_NAME"
+
+[[ -z "${VIRTUAL_KEY:-}" ]] && { echo "VIRTUAL_KEY env not set" >&2; exit 1; }
+
+case "$TYPE" in
+  python) IMAGE="ai-fortress/python-dev:latest" ;;
+  *)      IMAGE="ghcr.io/anomalyco/opencode:latest" ;;
+esac
+
+USER_FLAGS="--user $(id -u):$(id -g)"
+
+exec docker run -it --rm \
+  $USER_FLAGS \
+  --name "agent-$PROJECT_NAME-$(date +%s)" \
+  --runtime=runsc \
+  --network sandbox_net \
+  --security-opt label=disable \
+  -v "$PROJECT_PATH:/work" \
+  -w /work \
+  -e ANTHROPIC_BASE_URL=http://authproxy:4000 \
+  -e ANTHROPIC_API_KEY="$VIRTUAL_KEY" \
+  -e OPENAI_BASE_URL=http://authproxy:4000/v1 \
+  -e OPENAI_API_KEY="$VIRTUAL_KEY" \
+  "$IMAGE"

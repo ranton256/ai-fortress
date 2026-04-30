@@ -1,0 +1,13 @@
+#!/bin/bash
+# Revoke a LiteLLM virtual key. Invoked via sudo by the agent launcher and the sweeper.
+# Install at /usr/local/sbin/fortress-revoke, mode 0750, owner root:fortress.
+set -euo pipefail
+KEY="${1:?missing key}"
+
+# shellcheck disable=SC1091
+source /etc/ai-fortress/upstream.env
+
+curl -fsS --max-time 5 -X POST http://127.0.0.1:4000/key/delete \
+    -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -nc --arg k "$KEY" '{keys:[$k]}')" >/dev/null

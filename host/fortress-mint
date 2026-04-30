@@ -1,0 +1,45 @@
+#!/bin/bash
+# Mint a per-session LiteLLM virtual key. Invoked via sudo by the agent launcher.
+# Install at /usr/local/sbin/fortress-mint, mode 0750, owner root:fortress.
+set -euo pipefail
+umask 077
+
+# Args: <project> <launcher_pid> <launcher_pid_start_ns>
+PROJECT="${1:?missing project}"
+LPID="${2:?missing pid}"
+LSTART="${3:?missing pid_start_ns}"
+
+# Validate inputs strictly — these become metadata that's later used by the sweeper.
+[[ "$PROJECT" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad project name" >&2; exit 2; }
+[[ "$LPID" =~ ^[0-9]+$ ]]              || { echo "bad pid" >&2; exit 2; }
+[[ "$LSTART" =~ ^[0-9]+$ ]]            || { echo "bad pid_start_ns" >&2; exit 2; }
+
+# Invoking user comes from sudo, not the user-controlled environment.
+HOST_USER="${SUDO_USER:-unknown}"
+
+# Read master key (this script runs as root via sudo).
+# shellcheck disable=SC1091
+source /etc/ai-fortress/upstream.env
+
+BODY=$(jq -n \
+  --arg project    "$PROJECT" \
+  --arg user       "$HOST_USER" \
+  --arg lpid       "$LPID" \
+  --arg lstart     "$LSTART" \
+  '{models:["claude-*","gpt-*"],
+    max_budget:5.0,
+    duration:"8h",
+    rpm_limit:60,
+    metadata:{project:$project, host_user:$user,
+              launcher_pid:$lpid, launcher_pid_start_ns:$lstart}}')
+
+RESP=$(curl -fsS --max-time 5 \
+    -X POST http://127.0.0.1:4000/key/generate \
+    -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+    -H "Content-Type: application/json" \
+    -d "$BODY")
+
+KEY=$(jq -r .key <<<"$RESP")
+[[ -z "$KEY" || "$KEY" == "null" ]] && { echo "mint failed: $RESP" >&2; exit 1; }
+
+printf '%s\n' "$KEY"

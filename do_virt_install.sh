@@ -39,6 +39,10 @@ DISK_PATH=/home/ranton/ai-fortress/ai-fortress-snapshot.qcow2
 # --filesystem type=mount,accessmode=passthrough,driver.type=virtiofs,source.dir=/home/ranton/projects,target.dir=host_projects \
 
 
+# vsock device (CID 42) lets the in-VM shim talk to the host's vsock relay
+# at CID 2:4000. CID is arbitrary (>= 3) but must be unique on this host.
+# Keep in sync with the value used by ai-fortress-vsock-relay on the host.
+
 virt-install \
   --connect qemu:///system \
   --name ai-fortress \
@@ -51,4 +55,5 @@ virt-install \
   --graphics none \
   --memorybacking source.type=memfd,access.mode=shared \
   --filesystem type=mount,accessmode=passthrough,driver.type=virtiofs,source.dir=${SOURCE_DIR},target.dir=${TARGET_DIR} \
+  --vsock cid.address=42,model=virtio \
   --qemu-commandline="-fw_cfg name=opt/org.flatcar-linux/config,file=/var/lib/libvirt/images/config.json"

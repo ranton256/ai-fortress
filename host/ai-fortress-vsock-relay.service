@@ -1,0 +1,20 @@
+[Unit]
+Description=AI Fortress vsock-to-LiteLLM relay
+After=ai-fortress-litellm.service
+Requires=ai-fortress-litellm.service
+
+[Service]
+Restart=always
+RestartSec=2
+ExecStart=/usr/bin/socat -ly \
+  VSOCK-LISTEN:4000,reuseaddr,fork \
+  TCP:127.0.0.1:4000,nodelay
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

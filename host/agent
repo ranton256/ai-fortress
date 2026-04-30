@@ -1,0 +1,48 @@
+#!/bin/bash
+# Host-side launcher. Install at ~/bin/agent, chmod +x.
+# Mints a per-session virtual key via sudo, then SSHes into the VM with
+# VIRTUAL_KEY in the environment. The master key never touches this process.
+set -euo pipefail
+
+PROJECT_NAME="${1:-}"
+TYPE="${2:-default}"
+[[ -z "$PROJECT_NAME" ]] && { echo "usage: agent <project> [python|default]" >&2; exit 1; }
+
+VM_NAME="${FORTRESS_VM_NAME:-ai-fortress}"
+VM_USER="${FORTRESS_VM_USER:-$USER}"
+
+resolve_vm_ip() {
+  local tries=0 ip
+  while (( tries < 20 )); do
+    ip=$(virsh -c qemu:///system -q domifaddr --source agent "$VM_NAME" 2>/dev/null \
+         | awk '/ipv4/ {sub(/\/.*/,"",$NF); print $NF; exit}') || true
+    if [[ -z "$ip" ]]; then
+      ip=$(virsh -c qemu:///system -q domifaddr "$VM_NAME" 2>/dev/null \
+           | awk '/ipv4/ {sub(/\/.*/,"",$NF); print $NF; exit}') || true
+    fi
+    if [[ -n "$ip" ]]; then printf '%s' "$ip"; return 0; fi
+    sleep 1
+    tries=$((tries+1))
+  done
+  return 1
+}
+
+VM_IP=$(resolve_vm_ip) || { echo "could not resolve $VM_NAME IP after 20s" >&2; exit 1; }
+
+# Capture launcher identity for the sweeper. PID + start-time-ns is unique
+# enough on this host: even with PID reuse after reboot, start-ns resets.
+LPID=$$
+LSTART=$(awk '{print $22}' "/proc/$$/stat")
+
+VIRTUAL_KEY=$(sudo -n /usr/local/sbin/fortress-mint "$PROJECT_NAME" "$LPID" "$LSTART")
+
+cleanup() {
+  sudo -n /usr/local/sbin/fortress-revoke "$VIRTUAL_KEY" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+ssh -t \
+    -o SendEnv=VIRTUAL_KEY \
+    -o ServerAliveInterval=30 \
+    "$VM_USER@$VM_IP" \
+    VIRTUAL_KEY="$VIRTUAL_KEY" /usr/local/bin/agent-vm "$PROJECT_NAME" "$TYPE"

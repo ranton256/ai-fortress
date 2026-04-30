@@ -1,0 +1,7 @@
+[Unit]
+Description=AI Fortress orphan virtual-key sweep
+After=ai-fortress-litellm.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/fortress-sweep

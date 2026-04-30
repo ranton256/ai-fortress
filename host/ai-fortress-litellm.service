@@ -1,0 +1,25 @@
+[Unit]
+Description=AI Fortress LiteLLM proxy
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Restart=always
+RestartSec=5
+EnvironmentFile=/etc/ai-fortress/upstream.env
+ExecStartPre=-/usr/bin/docker rm -f ai-fortress-litellm
+ExecStartPre=/usr/bin/install -d -m 0750 -o 1500 -g 1500 /var/lib/ai-fortress
+ExecStart=/usr/bin/docker run --rm --name ai-fortress-litellm \
+  --network host \
+  --user 1500:1500 \
+  -v /etc/ai-fortress/litellm-config.yaml:/app/config.yaml:ro \
+  -v /var/lib/ai-fortress:/var/lib/ai-fortress \
+  -e ANTHROPIC_UPSTREAM_KEY \
+  -e OPENAI_UPSTREAM_KEY \
+  -e LITELLM_MASTER_KEY \
+  docker.io/litellm/litellm@sha256:6c82d338a60e7b273ae46bf1d8db814d2856ae010f96c44eeadde574d3893f76 \
+  --config /app/config.yaml --host 127.0.0.1 --port 4000
+ExecStop=/usr/bin/docker stop ai-fortress-litellm
+
+[Install]
+WantedBy=multi-user.target

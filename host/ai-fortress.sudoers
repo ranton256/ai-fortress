@@ -1,0 +1,3 @@
+# Install at /etc/sudoers.d/ai-fortress, mode 0440, owner root:root.
+# Validate before installing: visudo -c -f host/ai-fortress.sudoers
+%fortress ALL=(root) NOPASSWD: /usr/local/sbin/fortress-mint, /usr/local/sbin/fortress-revoke

@@ -144,6 +144,18 @@ bash push_image_to_vm.sh my-custom:latest
 
 **HOME inside the sandbox.** `agent-vm` sets `HOME=/work` so cache directories created by the agent (Bun, npm, pip, etc.) end up under the project bind-mount. Add the relevant cache paths to your project's `.gitignore` if you don't want to commit them. If your image has a baked-in user with a proper home directory and you'd rather use that, override `HOME` from inside the image's entrypoint.
 
+### Copying arbitrary files to the VM
+
+For everything that isn't a Docker image (config snippets, build artifacts, dotfiles, etc.) there's `cp_to_vm.sh` — an `rsync`-based helper with `scp`-style calling convention:
+
+```bash
+bash cp_to_vm.sh notes.md /tmp/                   # single file
+bash cp_to_vm.sh ./build /opt/myapp/              # directory, recursive
+bash cp_to_vm.sh a.txt b.txt c.txt /home/ranton/  # many sources, one dest
+```
+
+Resolves the VM IP via `virsh` (filtering loopback), preserves perms/timestamps, and re-runs cheaply (only changed bytes are sent). For destinations that need root on the VM side, drop into `/tmp/` first and finish with `ssh ranton@<vm> 'sudo install ...'`.
+
 ## Reference
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — full as-built architecture, network flow, controls, threat model.

@@ -254,6 +254,10 @@ Secrets only flow downward, one tier at a time, and only the minimum required at
 - **Audit trail:** Bifrost's request log is in its SQLite store at `/var/lib/ai-fortress/config.db` (LiteLLM-era `litellm.db` is gone).
 - **Test plan:** the 47-test verification battery lives in `verify-phase1.sh`, `verify-phase2.sh`, `verify-phase3.sh`. Re-run any time after a config change.
 - **Rollback:** `rollback.md` documents how to unwind by phase. The pre-deployment artifacts are `~/ai-fortress-pre-v2.tgz` (host `/etc` backup) and the `pre-network-v2` libvirt snapshot (recreate after each disk re-provision).
+- **Sandbox images:** the VM's Docker daemon needs sandbox images present locally before `agent <project> <variant>` can use them. Two helpers manage this:
+  - `build_python_in_vm.sh` — SCPs `Dockerfile.python` + `build_python.sh` into the VM and builds `ai-fortress/python-dev:latest` there. Re-run after each re-provision.
+  - `push_image_to_vm.sh <image[:tag]> [...]` — for any image built on the host, streams it into the VM via `docker save | ssh "docker load"` (no temp tarball). Used for custom agent images that need host-side build context.
+- **Sandbox `HOME`:** `agent-vm` sets `HOME=/work` so caches (Bun, npm, pip) end up in the project bind-mount instead of unwritable `/`. Project `.gitignore` should exclude `.bun/`, `.npm/`, `.cache/`, `.local/` etc. Images that bake in a proper user with a writable home dir can override `HOME` from their entrypoint.
 
 ---
 
@@ -274,6 +278,7 @@ These are the things that surfaced during implementation and don't appear in `ne
 | Sandbox cannot resolve `authproxy` despite being on `sandbox_net` | runsc's netstack doesn't reach Docker's embedded DNS at 127.0.0.11 | `agent-vm` looks up the shim's IP at launch time and passes `--add-host authproxy:<ip>` |
 | `virsh domifaddr --source agent` returns `127.0.0.1` | Flatcar has no qemu-guest-agent; virsh returns the VM's lo address | `host/agent` and verify scripts filter `127.0.0.0/8` and fall through to the DHCP lease |
 | `--connect qemu:///system` missing from `burn_it_down.sh` | The repo's libvirt URI is system, not user session | Added `--connect qemu:///system` and `--snapshots-metadata` |
+| Bun-based sandbox image fails on launch with `EACCES: mkdir '/.local'` | `--user 1000:1000` overrides image's `USER`; if the image didn't bake a user with a home dir via `useradd -m`, `$HOME` defaults to `/` and any `~/.cache` write fails | `agent-vm` now passes `-e HOME=/work` so caches go into the writable bind-mount. Tradeoff: caches accumulate in the project dir; users add `.bun/`, `.npm/` etc. to `.gitignore` |
 
 ---
 

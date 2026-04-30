@@ -118,10 +118,31 @@ A green run on all three is the definition of "Phase complete."
 ## Usage
 
 ```bash
-agent <project-folder-name> [python|default]
+agent <project-folder-name> [python|default|<your-image>]
 ```
 
 `agent` mints a per-session virtual key, SSHes into the VM, and starts a gVisor-trapped container scoped to `/projects/<project>`. The agent inside the container talks to `authproxy:4000` instead of `api.anthropic.com`; the sandbox has no other network egress. On exit, the virtual key is revoked. Stale keys (e.g. after `kill -9`) are reaped within ~5 minutes by the `ai-fortress-key-sweep.timer`.
+
+### Image management
+
+Two image variants are wired into `agent-vm` by default: `default` (`ghcr.io/anomalyco/opencode:latest`, pulled from a registry on first use) and `python` (`ai-fortress/python-dev:latest`, built from the local `Dockerfile.python`). For custom images, build on the host and push the image into the VM's Docker daemon — three helpers cover the common patterns:
+
+```bash
+# Re-build the python-dev image inside the VM (e.g. after a re-provision).
+bash build_python_in_vm.sh
+
+# Build any image on the host, then stream it into the VM's docker daemon
+# via `docker save | ssh "docker load"` (no temp tarball on disk).
+docker build -t my-custom:latest -f Dockerfile.foo \
+  --build-arg USER_UID=$(id -u) \
+  --build-arg USER_GID=$(id -g) \
+  --build-arg USERNAME=$(whoami) .
+bash push_image_to_vm.sh my-custom:latest
+```
+
+`agent <project> my-custom` then launches a sandbox using `my-custom:latest`. (You'll need a small case-statement edit in `vm/agent-vm` to map a friendly name like `worker` to your image — or just refer to the full tag.)
+
+**HOME inside the sandbox.** `agent-vm` sets `HOME=/work` so cache directories created by the agent (Bun, npm, pip, etc.) end up under the project bind-mount. Add the relevant cache paths to your project's `.gitignore` if you don't want to commit them. If your image has a baked-in user with a proper home directory and you'd rather use that, override `HOME` from inside the image's entrypoint.
 
 ## Reference
 

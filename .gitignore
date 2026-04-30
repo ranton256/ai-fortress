@@ -2,3 +2,9 @@ config.json
 ai-fortress-snapshot.qcow2
 flatcar_production_qemu_image.img
 .env
+
+# Sensitive runtime artifacts and one-off diagnostic outputs
+rulset_list_out.txt
+nft_*.txt
+*.tgz
+diag-*.sh

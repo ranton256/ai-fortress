@@ -1,29 +1,66 @@
 #!/bin/bash
-# Reap LiteLLM virtual keys whose owning launcher PID is gone.
+# Reap Bifrost virtual keys whose owning launcher PID is gone OR whose age
+# exceeds the TTL window. Bifrost has no native TTL, so we enforce it here.
 # Install at /usr/local/sbin/fortress-sweep, mode 0750, owner root:root.
 # Run by ai-fortress-key-sweep.timer every 5 minutes.
 set -euo pipefail
 
+TTL_SECONDS=$((8 * 3600))    # 8h, must match fortress-mint's reset_duration
+
 # shellcheck disable=SC1091
 source /etc/ai-fortress/upstream.env
 
-KEYS=$(curl -fsS --max-time 10 \
-    -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
-    "http://127.0.0.1:4000/key/info?return_full_object=true" || true)
+LIST=$(curl -fsS --max-time 10 \
+    -u "$BIFROST_ADMIN_USERNAME:$BIFROST_ADMIN_PASSWORD" \
+    http://127.0.0.1:4000/api/governance/virtual-keys || true)
+[[ -z "$LIST" ]] && exit 0
 
-[[ -z "$KEYS" ]] && exit 0
+NOW_NS=$(date +%s%N)
+TTL_NS=$((TTL_SECONDS * 1000000000))
 
-jq -c '.keys[]? | select(.metadata.launcher_pid != null)' <<<"$KEYS" \
+# Bifrost's GET response wraps in {"virtual_keys":[...]} or returns a bare list
+# depending on version — try both.
+jq -c '.virtual_keys[]? // .[]?' <<<"$LIST" \
 | while read -r entry; do
-    KEY_TOKEN=$(jq -r .token <<<"$entry")
-    LPID=$(jq -r '.metadata.launcher_pid'          <<<"$entry")
-    LSTART=$(jq -r '.metadata.launcher_pid_start_ns' <<<"$entry")
+    VK_ID=$(jq -r '.id' <<<"$entry")
+    DESC=$(jq -r '.description // ""' <<<"$entry")
+    [[ -z "$DESC" || "$DESC" == "null" ]] && continue
 
-    # If the PID still exists AND its start-time matches, the launcher is alive.
-    if [[ -r "/proc/$LPID/stat" ]]; then
-      CUR_START=$(awk '{print $22}' "/proc/$LPID/stat" 2>/dev/null || echo 0)
-      [[ "$CUR_START" == "$LSTART" ]] && continue
+    META=$(jq -e . <<<"$DESC" 2>/dev/null) || continue
+    LPID=$(jq   -r '.launcher_pid          // empty' <<<"$META")
+    LSTART=$(jq -r '.launcher_pid_start_ns // empty' <<<"$META")
+    CREATED=$(jq -r '.created_at_ns        // empty' <<<"$META")
+
+    [[ -z "$LPID" ]] && continue   # not one of ours
+
+    REASON=""
+
+    # (a) age-based TTL
+    if [[ -n "$CREATED" ]]; then
+      AGE_NS=$((NOW_NS - CREATED))
+      if (( AGE_NS > TTL_NS )); then
+        REASON="ttl-expired"
+      fi
     fi
 
-    /usr/local/sbin/fortress-revoke "$KEY_TOKEN" || true
+    # (b) launcher dead (only if not already condemned by TTL)
+    if [[ -z "$REASON" ]]; then
+      if [[ ! -r "/proc/$LPID/stat" ]]; then
+        REASON="launcher-gone"
+      else
+        CUR_START=$(awk '{print $22}' "/proc/$LPID/stat" 2>/dev/null || echo 0)
+        if [[ "$CUR_START" != "$LSTART" ]]; then
+          REASON="launcher-pid-reused"
+        fi
+      fi
+    fi
+
+    [[ -z "$REASON" ]] && continue
+
+    curl -fsS --max-time 5 \
+        -X DELETE \
+        -u "$BIFROST_ADMIN_USERNAME:$BIFROST_ADMIN_PASSWORD" \
+        "http://127.0.0.1:4000/api/governance/virtual-keys/$VK_ID" \
+        >/dev/null || true
+    logger -t fortress-sweep "revoked vk $VK_ID ($REASON)"
   done

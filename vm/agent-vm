@@ -24,8 +24,8 @@ exec docker run -it --rm \
   --security-opt label=disable \
   -v "$PROJECT_PATH:/work" \
   -w /work \
-  -e ANTHROPIC_BASE_URL=http://authproxy:4000 \
+  -e ANTHROPIC_BASE_URL=http://authproxy:4000/anthropic \
   -e ANTHROPIC_API_KEY="$VIRTUAL_KEY" \
-  -e OPENAI_BASE_URL=http://authproxy:4000/v1 \
+  -e OPENAI_BASE_URL=http://authproxy:4000/openai/v1 \
   -e OPENAI_API_KEY="$VIRTUAL_KEY" \
   "$IMAGE"

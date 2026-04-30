@@ -1,6 +1,6 @@
 [Unit]
 Description=AI Fortress orphan virtual-key sweep
-After=ai-fortress-litellm.service
+After=ai-fortress-bifrost.service
 
 [Service]
 Type=oneshot

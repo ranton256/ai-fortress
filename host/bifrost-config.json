@@ -1,0 +1,55 @@
+{
+  "$schema": "https://www.getbifrost.ai/schema",
+  "client": {
+    "allow_direct_keys": false,
+    "drop_excess_requests": false,
+    "enable_logging": true,
+    "enforce_auth_on_inference": true,
+    "initial_pool_size": 100,
+    "max_request_body_size_mb": 10
+  },
+  "config_store": {
+    "config": {
+      "path": "/app/data/config.db"
+    },
+    "enabled": true,
+    "type": "sqlite"
+  },
+  "governance": {
+    "auth_config": {
+      "admin_username": "env.BIFROST_ADMIN_USERNAME",
+      "admin_password": "env.BIFROST_ADMIN_PASSWORD",
+      "_comment": "is_enabled+disable_auth_on_inference: admin basic-auth required on /api/governance/*, NOT on inference routes (those validate by sk-bf-* virtual key only)",
+      "is_enabled": true,
+      "disable_auth_on_inference": true
+    }
+  },
+  "providers": {
+    "anthropic": {
+      "keys": [
+        {
+          "name": "main",
+          "value": "env.ANTHROPIC_UPSTREAM_KEY",
+          "weight": 1.0
+        }
+      ],
+      "concurrency_and_buffer_size": {
+        "concurrency": 10,
+        "buffer_size": 100
+      }
+    },
+    "openai": {
+      "keys": [
+        {
+          "name": "main",
+          "value": "env.OPENAI_UPSTREAM_KEY",
+          "weight": 1.0
+        }
+      ],
+      "concurrency_and_buffer_size": {
+        "concurrency": 10,
+        "buffer_size": 100
+      }
+    }
+  }
+}

@@ -1,13 +1,24 @@
 #!/bin/bash
-# Revoke a LiteLLM virtual key. Invoked via sudo by the agent launcher and the sweeper.
+# Revoke a Bifrost virtual key by value (sk-bf-*).
 # Install at /usr/local/sbin/fortress-revoke, mode 0750, owner root:fortress.
+#
+# Bifrost's DELETE endpoint addresses keys by id, not by value, so we list
+# all virtual keys and find the one with the matching value.
 set -euo pipefail
 KEY="${1:?missing key}"
 
 # shellcheck disable=SC1091
 source /etc/ai-fortress/upstream.env
 
-curl -fsS --max-time 5 -X POST http://127.0.0.1:4000/key/delete \
-    -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
-    -H "Content-Type: application/json" \
-    -d "$(jq -nc --arg k "$KEY" '{keys:[$k]}')" >/dev/null
+VK_ID=$(curl -fsS --max-time 5 \
+    -u "$BIFROST_ADMIN_USERNAME:$BIFROST_ADMIN_PASSWORD" \
+    http://127.0.0.1:4000/api/governance/virtual-keys \
+  | jq -r --arg k "$KEY" '.virtual_keys[]? // .[]? | select(.value == $k) | .id' \
+  | head -n1)
+
+[[ -z "$VK_ID" ]] && exit 0   # already gone — nothing to do
+
+curl -fsS --max-time 5 \
+    -X DELETE \
+    -u "$BIFROST_ADMIN_USERNAME:$BIFROST_ADMIN_PASSWORD" \
+    "http://127.0.0.1:4000/api/governance/virtual-keys/$VK_ID" >/dev/null

@@ -17,10 +17,10 @@ You can tell which phases have been applied by checking these markers:
 
 | Marker                                                 | Indicates                          |
 |--------------------------------------------------------|------------------------------------|
-| `id litellm` succeeds                                  | install-phase1.sh ran              |
+| `id bifrost` succeeds                                  | install-phase1.sh ran              |
 | `getent group fortress` succeeds                       | install-phase1.sh ran              |
 | `test -f /etc/ai-fortress/upstream.env`                | install-phase1.sh ran              |
-| `systemctl is-active ai-fortress-litellm`              | start-phase1.sh ran                |
+| `systemctl is-active ai-fortress-bifrost`              | start-phase1.sh ran                |
 | `sudo nft list table inet ai_fortress` returns rules   | start-phase1.sh ran                |
 | `virsh -c qemu:///system dumpxml ai-fortress \| grep vsock` | Phase 2 libvirt edit applied  |
 | `ssh "$VM_USER@$VM_IP" 'systemctl is-active vsock-shim'` reports active | Phase 2 VM provisioning applied |
@@ -32,7 +32,7 @@ Run them in order — earlier phases can be rolled back without touching later o
 
 ## 1. Rollback after `install-phase1.sh` only (no services started yet)
 
-This unwinds: `litellm` user, `fortress` group, `/etc/ai-fortress/`, helper scripts, sudoers, systemd unit files, nft fragment file. No services were started, no nft rules were loaded.
+This unwinds: `bifrost` user (or legacy `litellm` user), `fortress` group, `/etc/ai-fortress/`, helper scripts, sudoers, systemd unit files, nft fragment file. No services were started, no nft rules were loaded.
 
 ```bash
 # Remove sudoers dropin first — if anything in the rest of this script breaks
@@ -45,7 +45,7 @@ sudo rm -f /usr/local/sbin/fortress-mint \
            /usr/local/sbin/fortress-sweep
 
 # Systemd unit files (none enabled yet at this stage)
-sudo rm -f /etc/systemd/system/ai-fortress-litellm.service \
+sudo rm -f /etc/systemd/system/ai-fortress-bifrost.service \
            /etc/systemd/system/ai-fortress-vsock-relay.service \
            /etc/systemd/system/ai-fortress-key-sweep.service \
            /etc/systemd/system/ai-fortress-key-sweep.timer
@@ -63,14 +63,14 @@ sudo rm -rf /etc/ai-fortress
 # User and group
 sudo gpasswd -d "$USER" fortress 2>/dev/null || true   # remove yourself from group
 sudo groupdel fortress 2>/dev/null || true
-sudo userdel litellm 2>/dev/null || true
+sudo userdel bifrost 2>/dev/null || sudo userdel litellm 2>/dev/null || true
 ```
 
 ### Verify rollback at this stage
 
 ```bash
 # All of these should fail / return empty:
-id litellm                               # should report "no such user"
+id bifrost                               # should report "no such user"
 getent group fortress                    # should be empty
 ls /etc/ai-fortress 2>&1                 # "No such file or directory"
 ls /etc/sudoers.d/ai-fortress 2>&1       # "No such file or directory"
@@ -89,10 +89,10 @@ agent-up test-project                    # original sandbox launches (Ctrl-D to 
 If services were started, do this *first*, then run section 1.
 
 ```bash
-# Stop and disable the services (order matters — relay depends on litellm)
+# Stop and disable the services (order matters — relay depends on bifrost)
 sudo systemctl disable --now ai-fortress-key-sweep.timer
 sudo systemctl disable --now ai-fortress-vsock-relay.service
-sudo systemctl disable --now ai-fortress-litellm.service
+sudo systemctl disable --now ai-fortress-bifrost.service
 
 # Remove the nft table from the running ruleset. This does NOT touch any
 # other rules; only our table is affected.
@@ -102,8 +102,10 @@ sudo nft delete table inet ai_fortress 2>/dev/null || true
 # pre-v2), do this too. Skip if you have other reasons to keep it on.
 sudo systemctl disable --now nftables.service
 
-# Confirm the litellm container is gone
-docker ps -a --filter name=ai-fortress-litellm --format '{{.Names}}'   # should be empty
+# Confirm the proxy container is gone
+docker ps -a --filter name=ai-fortress-bifrost --format '{{.Names}}'   # should be empty
+docker rm -f ai-fortress-bifrost 2>/dev/null || true
+# (legacy LiteLLM-era container, if it ever existed)
 docker rm -f ai-fortress-litellm 2>/dev/null || true
 
 # Then proceed with section 1.
@@ -112,7 +114,7 @@ docker rm -f ai-fortress-litellm 2>/dev/null || true
 ### Verify rollback at this stage
 
 ```bash
-systemctl is-active ai-fortress-litellm 2>&1       # "inactive" or "could not find unit"
+systemctl is-active ai-fortress-bifrost 2>&1       # "inactive" or "could not find unit"
 sudo nft list table inet ai_fortress 2>&1          # "No such file or directory"
 ss -lx | grep -i vsock                             # empty
 docker ps --filter name=ai-fortress 2>&1           # nothing matches
@@ -184,7 +186,7 @@ When in doubt or rolling back is getting messy:
 
 ```bash
 # 1. Stop everything we may have started
-sudo systemctl disable --now ai-fortress-litellm ai-fortress-vsock-relay \
+sudo systemctl disable --now ai-fortress-bifrost ai-fortress-vsock-relay \
                               ai-fortress-key-sweep.timer nftables 2>/dev/null || true
 sudo nft flush ruleset
 
@@ -203,7 +205,7 @@ sudo tar xzf ~/ai-fortress-pre-v2.tgz -C /
 # 4. Remove the user + group we created
 sudo gpasswd -d "$USER" fortress 2>/dev/null || true
 sudo groupdel fortress 2>/dev/null || true
-sudo userdel litellm 2>/dev/null || true
+sudo userdel bifrost 2>/dev/null || sudo userdel litellm 2>/dev/null || true
 
 # 5. Restore the VM to its pre-v2 state
 virsh -c qemu:///system destroy ai-fortress 2>/dev/null || true
@@ -248,12 +250,12 @@ sudo nft flush ruleset
 
 This drops *all* nft rules, returning the system to "no firewall." Rerun `start-phase1.sh` only after diagnosing why our table caused trouble.
 
-### 6c. LiteLLM container is consuming too much resources
+### 6c. Proxy container is consuming too many resources
 
 ```bash
-sudo systemctl stop ai-fortress-litellm.service
-docker stop ai-fortress-litellm 2>/dev/null
-sudo systemctl disable ai-fortress-litellm.service
+sudo systemctl stop ai-fortress-bifrost.service
+docker stop ai-fortress-bifrost 2>/dev/null
+sudo systemctl disable ai-fortress-bifrost.service
 ```
 
 The unit has `Restart=always`, so `stop` alone is enough only if `disable` follows.
@@ -272,7 +274,7 @@ If the snapshot itself is broken, the VM disk file is at `/home/ranton/ai-fortre
 
 ## 7. What rollback does NOT undo
 
-- API spend already incurred while LiteLLM was running. Check `/var/lib/ai-fortress/litellm.db` (SQLite) for the audit trail before deleting it.
+- API spend already incurred while the proxy was running. Check `/var/lib/ai-fortress/config.db` (SQLite) for the audit trail before deleting it.
 - Anything you did inside a sandbox during testing. The host's view of `/projects/` is the source of truth — sandboxes can only modify files you can already modify yourself.
 - Snapshot/backup files left in `~`. Delete them manually when you're sure they're not needed.
 

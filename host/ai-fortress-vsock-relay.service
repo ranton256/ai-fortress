@@ -1,7 +1,7 @@
 [Unit]
 Description=AI Fortress vsock-to-LiteLLM relay
-After=ai-fortress-litellm.service
-Requires=ai-fortress-litellm.service
+After=ai-fortress-bifrost.service
+Requires=ai-fortress-bifrost.service
 
 [Service]
 Restart=always

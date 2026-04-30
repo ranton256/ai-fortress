@@ -28,22 +28,31 @@ echo "nftables.service enabled"
 
 # -------------------------------------------------------------------------
 say "2. enable + start services"
-systemctl enable --now ai-fortress-litellm.service
-systemctl enable --now ai-fortress-vsock-relay.service
-systemctl enable --now ai-fortress-key-sweep.timer
+systemctl enable --now ai-fortress-bifrost.service
+systemctl enable ai-fortress-vsock-relay.service ai-fortress-key-sweep.timer
+# Restart so any dependency or unit-file change picks up cleanly
+# (e.g. the vsock-relay dependency switched from litellm to bifrost).
+systemctl restart ai-fortress-vsock-relay.service
+systemctl restart ai-fortress-key-sweep.timer
 
 # -------------------------------------------------------------------------
 say "3. quick smoke checks"
-sleep 2  # let LiteLLM finish starting
+# Bifrost can take a few seconds to migrate the SQLite schema on first boot.
+for _ in $(seq 1 15); do
+  if curl -fsS --max-time 2 http://127.0.0.1:4000/health >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
 
-echo -n "litellm health: "
+echo -n "bifrost health: "
 curl -fsS --max-time 5 http://127.0.0.1:4000/health >/dev/null && echo OK || echo FAIL
 
-echo -n "litellm runs as 1500:1500: "
-docker inspect ai-fortress-litellm --format '{{.Config.User}}' 2>/dev/null
+echo -n "bifrost runs as 1500:1500: "
+docker inspect ai-fortress-bifrost --format '{{.Config.User}}' 2>/dev/null
 
 echo -n "vsock listener bound: "
-ss -lx | grep -qi vsock && echo OK || echo FAIL
+ss -ln | awk '$1=="v_str" && $2=="LISTEN"' | grep -q . && echo OK || echo FAIL
 
 echo
 echo "Phase 1 active. Run network-test-plan.md A1-* and B1-* tests next."

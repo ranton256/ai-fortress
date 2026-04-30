@@ -1,0 +1,27 @@
+[Unit]
+Description=AI Fortress Bifrost LLM gateway
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Restart=always
+RestartSec=5
+EnvironmentFile=/etc/ai-fortress/upstream.env
+ExecStartPre=-/usr/bin/docker rm -f ai-fortress-bifrost
+ExecStartPre=/usr/bin/install -d -m 0750 -o 1500 -g 1500 /var/lib/ai-fortress
+ExecStartPre=/usr/bin/install -m 0640 -o 1500 -g 1500 /etc/ai-fortress/bifrost-config.json /var/lib/ai-fortress/config.json
+ExecStart=/usr/bin/docker run --rm --name ai-fortress-bifrost \
+  --network host \
+  --user 1500:1500 \
+  -v /var/lib/ai-fortress:/app/data \
+  -e BIFROST_HOST=127.0.0.1 \
+  -e ANTHROPIC_UPSTREAM_KEY \
+  -e OPENAI_UPSTREAM_KEY \
+  -e BIFROST_ADMIN_USERNAME \
+  -e BIFROST_ADMIN_PASSWORD \
+  docker.io/maximhq/bifrost@sha256:ef9efcf3332e559d3d6748c807006e4271860f7d256ebd6ae0f714c6929792c3 \
+  -port 4000 -host 127.0.0.1
+ExecStop=/usr/bin/docker stop ai-fortress-bifrost
+
+[Install]
+WantedBy=multi-user.target

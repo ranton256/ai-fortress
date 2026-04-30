@@ -16,9 +16,10 @@
 
 
 
-virsh destroy ai-fortress && virsh undefine ai-fortress
+virsh -c qemu:///system destroy ai-fortress 2>/dev/null
+virsh -c qemu:///system undefine --snapshots-metadata ai-fortress
 
-rm ~/ai-fortress/ai-fortress-snapshot.qcow2
+rm -f ~/ai-fortress/ai-fortress-snapshot.qcow2
 bash make_overlay.sh
 
 echo "Now run ./do_virt_install.sh"

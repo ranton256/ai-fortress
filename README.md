@@ -1,153 +1,138 @@
-# README: The AI Fortress (Flatcar + gVisor + Libvirt)
+# AI Fortress
 
-This setup represents a **"Defense-in-Depth"** approach to agentic AI development. By moving the execution of AI-generated code from your primary workstation into a multi-layered sandbox, you mitigate the risk of "stochastic accidents" or malicious escapes while maintaining high performance on local hardware.
+A defense-in-depth sandbox for running AI coding agents on a workstation. Five independent isolation boundaries between agent-generated code and your host.
 
-## 1. Background & Motivation
+## Why
 
-AI agents (OpenCode, Claude Code, etc.) are increasingly capable of executing shell commands and writing to the filesystem. However, giving an LLM-driven process direct access to a primary workstation presents significant security risks:
+AI agents like Claude Code and OpenCode execute shell commands and write files on your behalf. That means arbitrary code runs on your machine with your user's permissions. A hallucinated `rm -rf`, a compromised pip package, or a container-escape exploit could damage or exfiltrate anything your user account can touch — including secrets in `~/.ssh`, `~/.aws`, `~/.gnupg`, and unrelated projects.
 
-- **Kernel Exploits:** A container escape could compromise the host.
-- **Data Exfiltration:** Agents could inadvertently (or maliciously) access private keys, documents, or unrelated projects.
-- **Dependency Hell:** Global installs by agents can clutter the host OS.
+Running an agent inside a single Docker container helps, but a container shares the host kernel. One privilege-escalation bug and the boundary is gone. AI Fortress puts five locks on the door, each independent of the others.
 
-**The Solution:** This architecture utilizes a "Russian Doll" isolation strategy:
+## What you get
 
-1. **Level 1 (KVM):** A dedicated Virtual Machine (Flatcar) isolates the environment from the physical host kernel.
-2. **Level 2 (Immutable OS):** Flatcar Container Linux provides a read-only root filesystem, preventing persistent malware.
-3. **Level 3 (gVisor):** A user-space kernel (`runsc`) intercepts syscalls, trapping the agent in a fake kernel.
-4. **Level 4 (Ephemeral Mounts):** Containers are scoped to specific subdirectories, ensuring one project cannot see another.
+| Layer | Boundary | Implemented by |
+|------:|----------|----------------|
+| 0 | Host process can't exfil upstream LLM credentials even if compromised | Bifrost LLM gateway, dedicated UID 1500, nftables `skuid` egress allowlist |
+| 1 | Agent can't touch the host kernel | KVM virtual machine (Flatcar Container Linux), virtio-fs project mount |
+| 2 | Persistent malware can't survive | Read-only `/usr` on Flatcar |
+| 3 | Container escape doesn't yield real syscalls | gVisor (`runsc`) user-space kernel |
+| 4 | Sandbox can't reach the public internet | Internal Docker bridge (`--internal`), vsock proxy is the only egress, per-session virtual key with $5/8h cap |
 
-## 2. Architecture Overview
+## Architecture
 
-- **Host:** Linux Workstation (Skia).
-- **VM:** Flatcar Container Linux (Stable) via `libvirt`.
-- **Storage:** `virtio-fs` bridges the host `~/projects` folder to the VM at `/projects`.
-- **Runtime:** `gVisor` (runsc) configured as a Docker runtime.
-
-## 3. Prerequisites
-
-- `libvirt`, `qemu-kvm`, and `virt-install` installed on the host.
-- Host user added to `libvirt` and `kvm` groups.
-- SELinux booleans set: `sudo setsebool -P virt_use_nfs 1` (for virtio-fs support).
-
-## 4. Setup Instructions
-
-### A. Prepare the Base Image
-
-1. Download the Flatcar QEMU image.
-
-2. Create a **Backing File** (Snapshot) to keep the base image pristine:
-
-   Bash
-
-   ```
-   qemu-img create -f qcow2 -F qcow2 -b ~/ai-fortress/flatcar_production_qemu_image.img ~/ai-fortress/ai-fortress-snapshot.qcow2 50G
-   ```
-
-### B. Generate Ignition Config
-
-Create a `config.bu` (Butane) file to define the VM state (users, mounts, and gVisor install service). Transpile it:
-
-Bash
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full diagram, request flow walkthrough, security controls catalog, and threat model. Quick visual:
 
 ```
-docker run --rm -i quay.io/coreos/butane:release < config.bu > config.json
-sudo mv config.json /var/lib/libvirt/images/
+host shell  →  ~/bin/agent  →  fortress-mint (sudo)  →  sk-bf-...
+                                                              │
+                                                              ▼
+                            ssh -t  …  VIRTUAL_KEY=sk-bf-…  /opt/bin/agent-vm
+                                                              │
+                                                              ▼
+                                                   docker run --runtime=runsc
+                                                              │
+                          sandbox  ──TCP──>  authproxy:4000  (sandbox_net, --internal)
+                                                              │
+                                                              ▼
+                                                       vsock-shim (runc)
+                                                              │
+                            ┌─────────────────────────────────┴────────────────────┐
+                            │  AF_VSOCK CID 2:4000  (KVM-mediated, never on IP)    │
+                            └─────────────────────────────────┬────────────────────┘
+                                                              ▼
+                                                       host vsock-relay (socat)
+                                                              │
+                                                              ▼
+                                                    Bifrost on 127.0.0.1:4000
+                                                              │
+                                            HTTPS (allowed only for UID 1500 by nft)
+                                                              ▼
+                                                      api.anthropic.com
 ```
 
-### C. Provision the VM
+The novel pieces vs. a typical "just use a container" setup are layer 0 (the proxy keeps real upstream API keys off the VM entirely) and layer 4 (every sandbox session gets a fresh budget-capped virtual key, and the upstream key never enters the sandbox).
 
-Run the `virt-install` script using `virtio-fs` for the project mount and `fw_cfg` to pass the Ignition config:
+## Setup
 
-Bash
-
-```
-virt-install \
-  --name ai-fortress \
-  --ram 16384 \
-  --vcpus 4 \
-  --disk path=~/ai-fortress/ai-fortress-snapshot.qcow2,format=qcow2 \
-  --filesystem type=mount,accessmode=passthrough,driver.type=virtiofs,source.dir=/home/ranton/projects,target.dir=host_projects \
-  --qemu-commandline="-fw_cfg name=opt/org.flatcar-linux/config,file=/var/lib/libvirt/images/config.json"
-```
-
-### D. Arm the Sandbox (Inside VM)
-
-1. Install gVisor to `/opt/bin/runsc`.
-2. Configure Docker (`/etc/docker/daemon.json`) to include the `runsc` runtime.
-3. Restart Docker: `sudo systemctl restart docker`.
-
-## 5. Usage: The "On-Demand" Agent
-
-Launch an isolated sandbox for a specific project directory:
-
-Bash
-
-```
-agent <project-folder-name>
-```
-
-This triggers the `agent-up` script, which launches a gVisor-trapped container with `--security-opt label=disable` to bypass SELinux conflicts between the VM and the sandbox.
-
-
-## Getting out of VM or cleaning up
-
-Getting stuck in a serial console is a rite of passage when working with headless VMs. Since you used `--graphics none`, your current terminal is "attached" to the VM's internal serial port.
-
-### 1. How to get out (Detach)
-To "escape" the console and get back to your host machine's prompt (**skia**) without stopping the VM, use the keyboard shortcut:
-
-**`Ctrl` + `]`** (Control and the right square bracket)
-
-> **Note:** If you are on a non-US keyboard, it is sometimes `Ctrl` + `5` or `Ctrl` + `Shift` + `]`.
-
----
-
-### 2. How to Shut Down or Kill the VM
-Once you are back at your host prompt, you have two options to stop the "Fortress":
-
-#### **Option A: The "Graceful" Way**
-This sends an ACPI shutdown signal (like pressing the power button).
-```bash
-virsh --connect qemu:///system shutdown ai-fortress
-```
-
-#### **Option B: The "Emergency" Way (Recommended for "issues")**
-If the VM is hung or the boot failed, use `destroy`. This is the equivalent of pulling the power cord. It doesn't delete the VM; it just stops the process immediately.
-```bash
-virsh --connect qemu:///system destroy ai-fortress
-```
-
----
-
-### 3. Cleaning up to start over
-If the "issues" you saw were related to the Ignition config not loading or a disk error, you should "undefine" the VM before running your script again. This wipes the VM's metadata from libvirt (but keeps your image files safe in `/var/lib/libvirt/images`).
+### 1. Pre-flight
 
 ```bash
-# 1. Kill it
-virsh --connect qemu:///system destroy ai-fortress
-
-# 2. Delete its registration
-virsh --connect qemu:///system undefine ai-fortress
+# VM snapshot + /etc backup so you can roll back
+virsh -c qemu:///system snapshot-create-as ai-fortress pre-network-v2
+sudo tar czf ~/ai-fortress-pre-v2.tgz /etc/nftables /etc/sysconfig/nftables.conf /etc/systemd/system /etc/sudoers.d
 ```
 
-### 4. How to see what went wrong
-Before you try again, you can check the logs to see why it was struggling:
+### 2. Host-side install
+
 ```bash
-# Check the last 50 lines of the VM's log
-sudo tail -n 50 /var/log/libvirt/qemu/ai-fortress.log
+# Idempotently creates user/group, installs helpers, units, sudoers, nft fragment.
+# Generates a Bifrost admin password automatically; leaves upstream API keys as
+# REPLACE-ME placeholders for you to fill in.
+sudo bash install-phase1.sh
+
+# Edit /etc/ai-fortress/upstream.env and put real Anthropic + OpenAI keys in.
+sudo $EDITOR /etc/ai-fortress/upstream.env
+
+# Get fortress group active in your shell
+newgrp fortress
+
+# Activate services + load nft rules
+sudo bash start-phase1.sh
 ```
 
-**Common "first boot" issues with Flatcar:**
-* **No Network:** If the console was just sitting there, it might be waiting for a DHCP address.
-* **Ignition Error:** If you see "failed to fetch config," it means the `fw_cfg` path in your script didn't point to the `config.json` correctly.
+### 3. VM provisioning
 
-What did the console output look like before you got stuck? If you saw a **"Reached target Multi-User System"** message, the VM actually booted successfully, and you're just a `Ctrl + ]` away from victory!
-after reboot to recreate things needed inside the VM after recreation
-you will need to verify networking still works
+```bash
+# Transpile config.bu → config.json (using butane container; install butane if you prefer)
+docker run --rm -i --user "$(id -u):$(id -g)" quay.io/coreos/butane:release < config.bu > config.json
+sudo install -m 0644 -o qemu -g qemu config.json /var/lib/libvirt/images/config.json
 
-setup /etc/docker/daemon.json
+# Burn down any prior VM and re-provision (the new config.bu adds vsock kernel
+# modules, sshd AcceptEnv, vsock-shim service, and runsc daemon.json)
+bash burn_it_down.sh
+bash do_virt_install.sh    # ctrl+] to detach console once it's running
+```
 
-make sure runsc is still installed
+### 4. Launchers
 
-restart docker daemon after change
+```bash
+# host launcher
+install -m 0755 host/agent ~/bin/agent
+
+# in-VM launcher (requires VM to be reachable via SSH)
+VM_IP=$(virsh -c qemu:///system -q domifaddr ai-fortress | awk '/ipv4/ {sub(/\/.*/,"",$NF); print $NF}')
+scp vm/agent-vm "ranton@$VM_IP":/tmp/agent-vm
+ssh "ranton@$VM_IP" 'sudo install -m 0755 /tmp/agent-vm /opt/bin/agent-vm && rm /tmp/agent-vm'
+```
+
+### 5. Verify
+
+```bash
+bash verify-phase1.sh   # 13 tests — host services
+bash verify-phase2.sh   # 16 tests — VM-side vsock + shim
+bash verify-phase3.sh   # 18 tests — launcher end-to-end + sandbox-side blocked paths
+```
+
+A green run on all three is the definition of "Phase complete."
+
+## Usage
+
+```bash
+agent <project-folder-name> [python|default]
+```
+
+`agent` mints a per-session virtual key, SSHes into the VM, and starts a gVisor-trapped container scoped to `/projects/<project>`. The agent inside the container talks to `authproxy:4000` instead of `api.anthropic.com`; the sandbox has no other network egress. On exit, the virtual key is revoked. Stale keys (e.g. after `kill -9`) are reaped within ~5 minutes by the `ai-fortress-key-sweep.timer`.
+
+## Reference
+
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — full as-built architecture, network flow, controls, threat model.
+- [`network-test-plan.md`](network-test-plan.md) — 47-test verification suite.
+- [`rollback.md`](rollback.md) — how to unwind safely by phase.
+- [`network-plan.md`](network-plan.md) and [`network-plan-v2.md`](network-plan-v2.md) — design history (superseded by ARCHITECTURE.md).
+- [`host/README-host-install.md`](host/README-host-install.md) — manual install steps if you don't want the script.
+
+## Getting in and out of the VM
+
+The `do_virt_install.sh` script attaches to the VM's serial console (`--graphics none`). To detach without stopping the VM, press **`Ctrl` + `]`**. To reattach: `virsh -c qemu:///system console ai-fortress`.
+
+To shut the VM down gracefully: `virsh -c qemu:///system shutdown ai-fortress`. To force-stop (equivalent of pulling the power cord): `virsh -c qemu:///system destroy ai-fortress`. To remove the libvirt registration entirely (project files on the host are unaffected): see `burn_it_down.sh`.

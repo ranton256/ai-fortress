@@ -1,5 +1,11 @@
 # AI Fortress: vsock Auth-Proxy Extension — Detailed Design (v2)
 
+> **Historical design document.** Superseded by `ARCHITECTURE.md` (the as-built
+> source of truth). The implementation diverged from this plan in several
+> ways (notably: LiteLLM was replaced by Bifrost; SELinux/seccomp/runsc-DNS
+> issues required workarounds). See the "Implementation deltas" section in
+> `ARCHITECTURE.md` for the full list. Retained for design history.
+
 This is a revision of `network-plan.md` (v1). The high-level architecture is unchanged: a host-side LiteLLM proxy mints short-lived virtual keys, and sandboxes reach it only over `AF_VSOCK`. v2 fixes correctness gaps in v1 (notably the nftables policy and cgroup match), shrinks the master-key blast radius, and promotes a few "future work" items to v1 because they are load-bearing for the security argument.
 
 ## Changes from v1

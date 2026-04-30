@@ -1,5 +1,11 @@
 # AI Fortress: vsock Auth-Proxy Extension — Detailed Design
 
+> **Historical design document.** This is the original plan; superseded first
+> by `network-plan-v2.md` (which fixed correctness gaps in this draft) and
+> ultimately by `ARCHITECTURE.md` (the as-built source of truth, which also
+> documents how the implementation diverged from this plan). Retained for
+> design history.
+
 ## Goals
 
 1. **No upstream API credentials inside the VM, ever.** The real `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` live only on the host workstation. A full VM compromise (gVisor escape + privilege escalation in Flatcar) must not yield them. The sandbox does still hold a credential — a short-lived virtual key — but never the upstream key that mints virtual keys or controls billing.

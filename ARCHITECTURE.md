@@ -258,6 +258,7 @@ Secrets only flow downward, one tier at a time, and only the minimum required at
   - `build_python_in_vm.sh` — SCPs `Dockerfile.python` + `build_python.sh` into the VM and builds `ai-fortress/python-dev:latest` there. Re-run after each re-provision.
   - `push_image_to_vm.sh <image[:tag]> [...]` — for any image built on the host, streams it into the VM via `docker save | ssh "docker load"` (no temp tarball). Used for custom agent images that need host-side build context.
 - **Generic file transfer:** `cp_to_vm.sh <local-source>... <vm-destination>` is a thin `rsync` wrapper for non-image artifacts (configs, build outputs, dotfiles). Mirrors scp calling convention; resolves the VM IP the same way the other helpers do.
+- **Root-owned destinations:** `install_to_vm.sh [-m MODE] <source>... <dest>` stages files in `/tmp/` then runs `sudo install` on the VM to place them at root-owned paths like `/opt/bin/` or `/etc/...`. Each invocation uses a unique staging dir and cleans up afterward. Use this instead of `cp_to_vm.sh` whenever the destination requires root.
 - **Sandbox `HOME`:** `agent-vm` sets `HOME=/work` so caches (Bun, npm, pip) end up in the project bind-mount instead of unwritable `/`. Project `.gitignore` should exclude `.bun/`, `.npm/`, `.cache/`, `.local/` etc. Images that bake in a proper user with a writable home dir can override `HOME` from their entrypoint.
 
 ---

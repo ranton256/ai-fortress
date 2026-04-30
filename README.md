@@ -154,7 +154,17 @@ bash cp_to_vm.sh ./build /opt/myapp/              # directory, recursive
 bash cp_to_vm.sh a.txt b.txt c.txt /home/ranton/  # many sources, one dest
 ```
 
-Resolves the VM IP via `virsh` (filtering loopback), preserves perms/timestamps, and re-runs cheaply (only changed bytes are sent). For destinations that need root on the VM side, drop into `/tmp/` first and finish with `ssh ranton@<vm> 'sudo install ...'`.
+Resolves the VM IP via `virsh` (filtering loopback), preserves perms/timestamps, and re-runs cheaply (only changed bytes are sent).
+
+For destinations that need root on the VM side (`/opt/bin/`, `/etc/...`), use `install_to_vm.sh` — it stages into `/tmp/` then runs `sudo install` to place the file with the requested mode, owned `root:root`:
+
+```bash
+bash install_to_vm.sh -m 0755 vm/agent-vm /opt/bin/agent-vm
+bash install_to_vm.sh -m 0644 ./foo.conf /etc/myapp/foo.conf
+bash install_to_vm.sh -m 0755 ./tool-a ./tool-b /opt/bin/    # many → dir
+```
+
+Each invocation creates a unique staging directory under `/tmp/` on the VM (so concurrent runs don't collide) and cleans up after itself. Mode defaults to `0755`. SSH allocates a TTY so `sudo` can prompt for your password.
 
 ## Reference
 

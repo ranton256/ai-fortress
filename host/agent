@@ -12,13 +12,18 @@ VM_NAME="${FORTRESS_VM_NAME:-ai-fortress}"
 VM_USER="${FORTRESS_VM_USER:-$USER}"
 
 resolve_vm_ip() {
+  # Filter out 127.0.0.0/8 — when qemu-guest-agent isn't running (Flatcar
+  # doesn't ship it), --source agent reports the VM's lo address, which
+  # would steer SSH at the host's sshd. Fall through to the DHCP lease.
+  local _filter='/ipv4/ {sub(/\/.*/,"",$NF); ip=$NF; if (ip !~ /^127\./) {print ip; exit}}'
   local tries=0 ip
   while (( tries < 20 )); do
-    ip=$(virsh -c qemu:///system -q domifaddr --source agent "$VM_NAME" 2>/dev/null \
-         | awk '/ipv4/ {sub(/\/.*/,"",$NF); print $NF; exit}') || true
+    ip=$(virsh -c qemu:///system -q domifaddr --source agent "$VM_NAME" 2>/dev/null | awk "$_filter") || true
     if [[ -z "$ip" ]]; then
-      ip=$(virsh -c qemu:///system -q domifaddr "$VM_NAME" 2>/dev/null \
-           | awk '/ipv4/ {sub(/\/.*/,"",$NF); print $NF; exit}') || true
+      ip=$(virsh -c qemu:///system -q domifaddr "$VM_NAME" 2>/dev/null | awk "$_filter") || true
+    fi
+    if [[ -z "$ip" ]]; then
+      ip=$(virsh -c qemu:///system -q domifaddr --source lease "$VM_NAME" 2>/dev/null | awk "$_filter") || true
     fi
     if [[ -n "$ip" ]]; then printf '%s' "$ip"; return 0; fi
     sleep 1

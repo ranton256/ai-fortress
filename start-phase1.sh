@@ -29,11 +29,14 @@ echo "nftables.service enabled"
 # -------------------------------------------------------------------------
 say "2. enable + start services"
 systemctl enable --now ai-fortress-bifrost.service
+systemctl enable --now ai-fortress-toolscrub.service
 systemctl enable ai-fortress-vsock-relay.service ai-fortress-key-sweep.timer
 # Restart so any dependency or unit-file change picks up cleanly
-# (e.g. the vsock-relay dependency switched from litellm to bifrost).
+# (e.g. the vsock-relay TCP target switched from Bifrost on 4000 to
+# the toolscrub on 4001 once the scrub was added).
 systemctl restart ai-fortress-vsock-relay.service
 systemctl restart ai-fortress-key-sweep.timer
+systemctl restart ai-fortress-toolscrub.service
 
 # -------------------------------------------------------------------------
 say "3. quick smoke checks"
@@ -45,8 +48,16 @@ for _ in $(seq 1 15); do
   sleep 1
 done
 
-echo -n "bifrost health: "
+echo -n "bifrost health (direct, :4000): "
 curl -fsS --max-time 5 http://127.0.0.1:4000/health >/dev/null && echo OK || echo FAIL
+
+# Toolscrub binds slightly after systemd reports active; poll briefly.
+for _ in $(seq 1 10); do
+  curl -fsS --max-time 2 http://127.0.0.1:4001/health >/dev/null 2>&1 && break
+  sleep 1
+done
+echo -n "toolscrub health (passthrough on :4001): "
+curl -fsS --max-time 5 http://127.0.0.1:4001/health >/dev/null && echo OK || echo FAIL
 
 echo -n "bifrost runs as 1500:1500: "
 docker inspect ai-fortress-bifrost --format '{{.Config.User}}' 2>/dev/null

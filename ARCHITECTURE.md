@@ -37,9 +37,14 @@ The novel layers compared to a typical "just use a container" setup are **layer 
 │         routes: /anthropic/v1/messages, /openai/v1/chat/completions,           │
 │                 /api/governance/virtual-keys (admin basic-auth)                │
 │                                                                                │
+│  systemd: ai-fortress-toolscrub.service                                        │
+│      └─ /usr/local/sbin/ai-fortress-toolscrub                                  │
+│         listen 127.0.0.1:4001 → upstream :4000                                 │
+│         strips server-side LLM tools from /anthropic/v1/messages bodies        │
+│                                                                                │
 │  systemd: ai-fortress-vsock-relay.service                                      │
 │      └─ socat VSOCK-LISTEN:4000,fork                                           │
-│              TCP:127.0.0.1:4000                                                │
+│              TCP:127.0.0.1:4001     (→ toolscrub → Bifrost)                    │
 │                                                                                │
 │  systemd: ai-fortress-key-sweep.timer  (every 5 min)                           │
 │      └─ revokes orphaned virtual keys (dead launcher PID, or > 8h old)         │
@@ -124,7 +129,16 @@ vsock-shim container (runc)
   │
 host vsock-relay (systemd)
   │  socat VSOCK-LISTEN:4000,reuseaddr,fork accepts
-  │  forks a child that does TCP:127.0.0.1:4000 (loopback only)
+  │  forks a child that does TCP:127.0.0.1:4001 (toolscrub, loopback)
+  │
+  ▼
+ai-fortress-toolscrub (systemd, host, 127.0.0.1:4001)
+  │  Reverse proxy. For /anthropic/v1/messages with JSON body, parses
+  │  the body, removes tools[] entries whose .type matches the regex
+  │  denylist (web_search/web_fetch/code_execution/computer with date
+  │  suffix), and forwards. Other paths and non-matching bodies pass
+  │  byte-for-byte. Streaming responses are flushed immediately
+  │  (httputil.ReverseProxy.FlushInterval = -1).
   │
   ▼
 Bifrost (--user 1500, --network host, listening 127.0.0.1:4000)
@@ -240,27 +254,35 @@ Secrets only flow downward, one tier at a time, and only the minimum required at
 | Compromised Bifrost image | Upstream keys, master password, internet on 443/53 | Image pinned by digest. nftables `skuid 1500` confines the container to 53/udp + 443/tcp only |
 | Stolen virtual key (logged somewhere) | LLM API access for ≤ 8h, ≤ $5 | Soft TTL via sweeper; budget cap; manual revoke via `sudo fortress-revoke <key>` |
 | Stolen master password | Equivalent to upstream-key compromise (mint unlimited keys) | Master password readable only as root or via the two helper scripts. A host-root compromise is required |
-| **Sandbox uses Claude's server-side tools (`web_fetch`, `web_search`, `code_execution`) to act outside the sandbox** | Whatever the upstream model's server-side tools can reach: the public web, a Python execution sandbox on Anthropic's infrastructure, etc. | **None at the network layer.** The fortress draws boundaries at networking and syscalls; neither notices a tool-use block traveling inside a legitimate Messages API request. See "LLM-as-egress channel" below for mitigations. |
+| Sandbox uses model's server-side tools (`web_fetch`, `web_search`, `code_execution`, `computer_*`) to act outside the sandbox | Whatever the upstream model's server-side tools can reach: the public web, a Python execution sandbox on Anthropic's infrastructure, etc. | **`ai-fortress-toolscrub` strips matching `tools[]` entries from inbound `/anthropic/v1/messages` request bodies** before they reach Bifrost. The model never sees the definitions, so it cannot invoke them. Application-layer fallback (OpenCode permission deny) is defense-in-depth. See "LLM-as-egress channel" below |
 | KVM escape | Host workstation | Out of scope — fortress was always advertised as ending here |
 | Compromised host | Everything | Out of scope |
 
 ### LLM-as-egress channel (the model's own tools)
 
-The fortress isolates *the agent process* from the public network. It does not — and cannot, at the network layer — isolate the *model*. Claude (and any LLM) ships with capabilities the SDK can advertise to it: `web_fetch_20250910`, `web_search_20250305`, `code_execution_20250825`, and the like. When a client (e.g. OpenCode) lists those tools in the `tools` array of a Messages API request, the model can invoke them, and the work happens on Anthropic's infrastructure. The result is returned in the same response.
+The fortress isolates *the agent process* from the public network. At the network and syscall layers, it cannot isolate the *model*. Claude ships with capabilities the SDK can advertise to it: `web_fetch_20250910`, `web_search_20250305`, `code_execution_20250825`, `computer_20250124`, and so on. When a client (e.g. OpenCode) lists those tools in the `tools` array of a Messages API request, the model can invoke them, and the work happens on Anthropic's infrastructure. The result is returned in the same response.
 
-From the sandbox's network namespace, only one TCP connection ever existed (to `authproxy:4000`), and our `B3-1`/`B3-2` blocked-path tests still pass: nothing in the sandbox can directly reach the internet. But via the LLM's tool-use channel, the agent effectively had access to:
+This is mitigated by `ai-fortress-toolscrub` — a small Go reverse proxy on host loopback that sits between the existing vsock-relay and Bifrost. For requests on configured inference paths (currently just `/anthropic/v1/messages`), it parses the JSON body, removes `tools[]` entries whose `type` matches a configured regex denylist (currently `^(web_search|web_fetch|code_execution|computer)_\d{8}$`), and forwards the modified request to Bifrost. For everything else (admin/governance API, streaming response bodies, requests with no matching tools, non-JSON bodies) the proxy is a byte-for-byte passthrough.
 
-- Arbitrary web pages, fetched and converted to text (`web_fetch`)
-- The public web search index (`web_search`)
-- A Python execution environment (`code_execution`)
+The model never sees the stripped tool definitions, so it cannot invoke them, so the egress channel is closed *regardless* of how the agent is configured. A different agent, a misconfigured agent, or a malicious sandbox process can no longer re-open the channel by re-listing the tools — the scrub is a workstation-wide policy.
 
-Three layers of mitigation, weakest to strongest:
+**Defense in depth still recommended.** OpenCode's `Dockerfile.worker` config also denies `webfetch`/`websearch`/`codesearch`. That's redundant with the scrub but provides:
+- Better local error messages when the model tries to use a tool (Claude says "I don't have that tool" instead of "I have it but it didn't return useful data").
+- Coverage of any future inference path the scrub doesn't yet cover (`/openai/v1/chat/completions`, `/genai/...`).
 
-1. **Application posture (cheapest, fastest, easy to bypass).** Configure the agent (OpenCode in our case) to *not advertise* these tools. If the tool isn't in the request's `tools` array, the model can't invoke it. This is per-application config, and a different agent — or a misconfigured one — would re-introduce the channel.
-2. **Proxy-level scrub (defense-in-depth).** Strip server-side tools from the request body inside Bifrost (or a small middleware in front of it) before it goes upstream. A workstation-wide policy that no agent can bypass by changing its own config. Bifrost's governance plugin has a `PreLLMHook` that's the natural place; ~30 lines of Go for a strip-tools rewrite. Recommended if this class of leak matters to your threat model.
-3. **Model/deployment choice.** Some Anthropic deployments don't expose server-side tools. Less flexible than the proxy filter but doesn't depend on a filter being maintained.
+**What the scrub does not cover.** It only handles request-side filtering for the inference paths in its config (currently Anthropic only). Future server-side tools that follow a different naming convention, or land on a different provider's path Bifrost exposes, would need an updated denylist or `scrub_paths`. The scrub does not modify response bodies — that's correct, since tool-*results* the model returns belong to the conversation history and stripping them would corrupt multi-turn conversations.
 
-This caveat is general — it applies to any LLM gateway, any agent, and any provider that exposes server-side tools. The fortress's existing controls are still load-bearing for *every other* exfil path; this just identifies the one channel that lives at a layer above the network.
+### Component design: ai-fortress-toolscrub
+
+- **Form factor:** static Go binary, ~5.6 MB, single config file, single systemd unit. Built reproducibly from `host/toolscrub/` via a digest-pinned `golang:1.22-alpine` image (`host/build-toolscrub.sh`).
+- **Listen / forward:** `127.0.0.1:4001` → `127.0.0.1:4000` (Bifrost).
+- **Hardening (in the systemd unit):** `User=root`-but-`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome=true`, `PrivateTmp`, `CapabilityBoundingSet=` (empty), `MemoryDenyWriteExecute`, `RestrictNamespaces`.
+- **Configuration:** `/etc/ai-fortress/toolscrub.json`. Fields: `listen`, `upstream`, `scrub_paths` (URL prefix list), `deny_tool_types` (regex list), `fail_open` (bool — what to do on JSON parse error: forward unchanged with warning, or return 400), `log_stripped` (bool), `max_body_bytes` (defaults to 10 MB; oversized bodies forward unscrubbed with a warning).
+- **Streaming:** `httputil.ReverseProxy.FlushInterval = -1` so SSE responses arrive token-by-token instead of being buffered.
+- **Byte-identical passthrough property:** `scrubBody` returns the *input slice* unchanged when nothing matches the denylist (no re-marshaling). Verified at the slice-pointer level by the table-driven Go unit tests in `host/toolscrub/scrub_test.go`.
+- **Failure modes:** Bifrost down → 502 from the proxy (same as today). Toolscrub down → relay can't connect to 4001 → sandbox sees connection error (mitigated by `Restart=always`). Body parse error with `fail_open: true` (default) → forward unchanged + warning. With `fail_open: false` → 400 to client.
+
+The scrub deliberately runs as a *separate* host process rather than a Bifrost plugin even though Bifrost has a public `LLMPlugin`/`PreLLMHook` interface. Bifrost plugins are compile-time; the in-tree governance plugin is a Go package linked into the binary. Using the hook would require forking Bifrost and re-pinning a custom image digest on every upstream release. The sidecar achieves the same security at zero Bifrost-fork maintenance cost. If Bifrost ever ships runtime-loadable plugins via config, we can revisit and migrate.
 
 ---
 
@@ -305,7 +327,6 @@ These are the things that surfaced during implementation and don't appear in `ne
 
 ## Known limitations / future work
 
-0. **LLM-as-egress channel.** Server-side LLM tools (`web_fetch`, `web_search`, `code_execution`) bypass the network sandbox entirely; they are tool-use blocks inside a legitimate Messages API call. See the "LLM-as-egress channel" section under Threat model for mitigations. Application-level fix: don't advertise the tools to the model. Proxy-level fix: strip them from the request body in Bifrost.
 1. **No SNI-based egress filtering at the host.** UID 1500 can reach any HTTPS host. Tightening would require a userspace SNI filter (mitmproxy or sslh) or a per-process netns. Tracked.
 2. **Strict forward-chain mode** is opt-in (commented out in `host/ai-fortress.nft`). Enabling it removes the VM's own internet access (breaks `docker pull` from inside the VM), and in return removes the relaxed-mode caveat in the threat model.
 3. **runsc DNS** is bypassed via `--add-host`; if the shim's IP rotates (it doesn't in normal operation, but it could after `docker network prune`), `agent-vm` re-resolves it on each launch.

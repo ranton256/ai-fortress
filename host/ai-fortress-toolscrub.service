@@ -1,0 +1,23 @@
+[Unit]
+Description=AI Fortress request-scrub for server-side LLM tools
+After=ai-fortress-bifrost.service
+Requires=ai-fortress-bifrost.service
+
+[Service]
+Restart=always
+RestartSec=2
+ExecStart=/usr/local/sbin/ai-fortress-toolscrub --config /etc/ai-fortress/toolscrub.json
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictNamespaces=true
+
+[Install]
+WantedBy=multi-user.target

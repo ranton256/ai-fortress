@@ -1,0 +1,17 @@
+{
+  "_comment_": "Filters server-side LLM tools out of inbound Anthropic Messages API requests before they reach Bifrost. See ARCHITECTURE.md, 'LLM-as-egress channel'. Initial scope is Anthropic only; OpenAI/Google can be added later by extending scrub_paths and deny_tool_types.",
+  "listen":   "127.0.0.1:4001",
+  "upstream": "http://127.0.0.1:4000",
+  "scrub_paths": [
+    "/anthropic/v1/messages"
+  ],
+  "deny_tool_types": [
+    "^web_search_\\d{8}$",
+    "^web_fetch_\\d{8}$",
+    "^code_execution_\\d{8}$",
+    "^computer_\\d{8}$"
+  ],
+  "fail_open":     true,
+  "log_stripped":  true,
+  "max_body_bytes": 10485760
+}

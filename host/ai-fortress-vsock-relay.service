@@ -1,14 +1,18 @@
 [Unit]
-Description=AI Fortress vsock-to-LiteLLM relay
-After=ai-fortress-bifrost.service
-Requires=ai-fortress-bifrost.service
+Description=AI Fortress vsock relay (vsock 4000 -> toolscrub 4001 -> Bifrost 4000)
+After=ai-fortress-toolscrub.service
+Requires=ai-fortress-toolscrub.service
 
 [Service]
 Restart=always
 RestartSec=2
+# Forward to the toolscrub on 4001, not Bifrost on 4000. The toolscrub
+# strips server-side LLM tools from inbound request bodies and then
+# forwards to Bifrost on 4000. See ARCHITECTURE.md, "LLM-as-egress
+# channel" for the rationale.
 ExecStart=/usr/bin/socat -ly \
   VSOCK-LISTEN:4000,reuseaddr,fork \
-  TCP:127.0.0.1:4000,nodelay
+  TCP:127.0.0.1:4001,nodelay
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

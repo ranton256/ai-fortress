@@ -93,6 +93,9 @@ After deploying the LiteLLM unit, vsock relay, helper scripts, sudoers, and nfta
 | A1-13 | LiteLLM as UID 1500 can reach :443              | `sudo -u bifrost -- curl -sS --max-time 5 -o /dev/null -w '%{http_code}' https://api.anthropic.com/`  | non-zero HTTP code (proves the connection completed); not `000` |
 | A1-14 | Sweeper unit + timer enabled                    | `systemctl is-enabled ai-fortress-key-sweep.timer`                                                   | `enabled`                                           |
 | A1-15 | Sweeper revokes orphan keys                     | mint a key with PID=`99999999` (a nonexistent PID) and start-ns `1`, then run `sudo /usr/local/sbin/fortress-sweep`, then list keys | the synthetic key is gone                           |
+| A1-16 | toolscrub service is active and listening       | `systemctl is-active ai-fortress-toolscrub` and `ss -ltn \| grep '127.0.0.1:4001'`                                                  | active and bound                                    |
+| A1-17 | clean request (no tools[]) round-trips through scrub | mint a VK, POST a no-tools `/anthropic/v1/messages` request through both `:4000` (direct) and `:4001` (scrub)                  | both succeed (or upstream-quota error)              |
+| A1-18 | client-side tools survive the scrub             | POST through `:4001` with `tools: [{type:"custom",...}]`, `tool_choice:{type:"tool",name:...}`                                     | model emits a `tool_use` block (or upstream-quota)  |
 
 ### Phase 1 blocked (B)
 

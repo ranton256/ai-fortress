@@ -258,6 +258,37 @@ docker stop ai-fortress-bifrost 2>/dev/null
 sudo systemctl disable ai-fortress-bifrost.service
 ```
 
+### 6d. Toolscrub is breaking inference (legitimate requests being rejected)
+
+The scrub is a separate process that can be turned off without uninstalling. The vsock-relay just needs to point back at Bifrost directly:
+
+```bash
+# Disable the scrub
+sudo systemctl disable --now ai-fortress-toolscrub.service
+
+# Edit the relay's TCP target back to Bifrost (port 4000)
+sudo sed -i 's|TCP:127.0.0.1:4001|TCP:127.0.0.1:4000|' /etc/systemd/system/ai-fortress-vsock-relay.service
+
+# Drop the dependency on the toolscrub
+sudo sed -i 's|^After=ai-fortress-toolscrub.service$|After=ai-fortress-bifrost.service|' /etc/systemd/system/ai-fortress-vsock-relay.service
+sudo sed -i 's|^Requires=ai-fortress-toolscrub.service$|Requires=ai-fortress-bifrost.service|' /etc/systemd/system/ai-fortress-vsock-relay.service
+
+sudo systemctl daemon-reload
+sudo systemctl restart ai-fortress-vsock-relay
+```
+
+You're now back to the pre-toolscrub topology (sandbox → relay → Bifrost). The LLM-as-egress channel is open again — re-enable application-layer denies in `Dockerfile.worker` if you want some protection while debugging.
+
+To fully remove the scrub:
+
+```bash
+sudo systemctl disable --now ai-fortress-toolscrub.service
+sudo rm -f /etc/systemd/system/ai-fortress-toolscrub.service \
+           /usr/local/sbin/ai-fortress-toolscrub \
+           /etc/ai-fortress/toolscrub.json
+sudo systemctl daemon-reload
+```
+
 The unit has `Restart=always`, so `stop` alone is enough only if `disable` follows.
 
 ### 6d. VM is broken / unreachable after Phase 2 changes

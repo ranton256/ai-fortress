@@ -100,8 +100,27 @@ visudo -c -f "$REPO_DIR/host/ai-fortress.sudoers"
 install -m 0440 -o root -g root "$REPO_DIR/host/ai-fortress.sudoers" /etc/sudoers.d/ai-fortress
 
 # -------------------------------------------------------------------------
+say "8a. ai-fortress-toolscrub binary + config"
+# Build the binary if it isn't there already (needs Docker; falls back
+# silently if no docker — admin can pre-build via host/build-toolscrub.sh).
+if [[ ! -x "$REPO_DIR/host/build/ai-fortress-toolscrub" ]] && command -v docker >/dev/null 2>&1; then
+  echo "building toolscrub binary via host/build-toolscrub.sh …"
+  ( cd "$REPO_DIR" && bash host/build-toolscrub.sh ) || \
+    { echo "WARNING: toolscrub build failed; install will continue but ai-fortress-toolscrub.service will fail to start" >&2; }
+fi
+if [[ -x "$REPO_DIR/host/build/ai-fortress-toolscrub" ]]; then
+  install -m 0755 -o root -g root \
+    "$REPO_DIR/host/build/ai-fortress-toolscrub" \
+    /usr/local/sbin/ai-fortress-toolscrub
+  echo "installed /usr/local/sbin/ai-fortress-toolscrub"
+fi
+install -m 0644 -o root -g root \
+  "$REPO_DIR/host/toolscrub-config.json" \
+  /etc/ai-fortress/toolscrub.json
+
 say "8. systemd unit files (installed, NOT enabled yet)"
 install -m 0644 -o root -g root "$REPO_DIR/host/ai-fortress-bifrost.service"     /etc/systemd/system/
+install -m 0644 -o root -g root "$REPO_DIR/host/ai-fortress-toolscrub.service"   /etc/systemd/system/
 install -m 0644 -o root -g root "$REPO_DIR/host/ai-fortress-vsock-relay.service" /etc/systemd/system/
 install -m 0644 -o root -g root "$REPO_DIR/host/ai-fortress-key-sweep.service"   /etc/systemd/system/
 install -m 0644 -o root -g root "$REPO_DIR/host/ai-fortress-key-sweep.timer"     /etc/systemd/system/

@@ -182,10 +182,15 @@ Each invocation creates a unique staging directory under `/tmp/` on the VM (so c
 ## Reference
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — full as-built architecture, network flow, controls, threat model.
+- [`MACOS-DESIGN.md`](MACOS-DESIGN.md) — proposed macOS port (research only, not implemented).
 - [`network-test-plan.md`](network-test-plan.md) — 47-test verification suite.
 - [`rollback.md`](rollback.md) — how to unwind safely by phase.
 - [`network-plan.md`](network-plan.md) and [`network-plan-v2.md`](network-plan-v2.md) — design history (superseded by ARCHITECTURE.md).
 - [`host/README-host-install.md`](host/README-host-install.md) — manual install steps if you don't want the script.
+
+## Future enhancements
+
+- **macOS support.** The fortress is Linux-only today (Fedora host, Flatcar guest, KVM/libvirt, nftables, systemd). [`MACOS-DESIGN.md`](MACOS-DESIGN.md) sketches a port to macOS (Apple Silicon primary, Intel secondary) using Lima on `Virtualization.framework`, `launchd`, `sandbox-exec` + PF in place of nftables-skuid, and a small Go/Swift vsock bridge in place of `socat VSOCK-LISTEN`. All five boundaries transfer in concept; only Layer 0's egress allowlist becomes meaningfully softer (PF + sandbox-exec belt-and-suspenders instead of one kernel rule). Research only — not implemented.
 
 ## Getting in and out of the VM
 
